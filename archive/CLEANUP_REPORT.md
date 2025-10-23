@@ -1,0 +1,134 @@
+﻿# Project Cleanup Report
+
+## Summary
+- **Date and Time:** 2025-07-30 18:14:40
+- **Total Files Removed:** 21
+- **Files Not Found:** 14
+- **Errors Encountered:** 82
+- **Backup Location:** c:\vs code projects\finalized strategies\cleanup_backups\20250730_181425
+
+## Files Successfully Removed
+- simple_strategy_test.py
+- test_trailing_stop_loss.py
+- direct_test.py
+- simple_test.py
+- check_methods.py
+- method_check.py
+- verify_methods.py
+- simple_check.py
+- ultimate_simple_test.py
+- final_test.py
+- bare_minimum_test.py
+- run_simple_strategy.py
+- run_standalone.py
+- final_run.py
+- direct_fix_trailing_stoploss.py
+- comprehensive_syntax_fix.py
+- enhanced_syntax_fix.py
+- direct_comprehensive_fix.py
+- patch_strategy.py
+- standalone_strategy.py
+- standalone_trailing_test.py
+
+## Files Not Found
+
+- simple_test.py
+- test_symbol_conversion.py
+- test_fyers_option_format.py
+- run_fixed.py
+- run_strategy_with_fixed_format.py
+- run_strategy_with_improved_websocket.py
+- fix_strategy_clean.py
+- fix_all_issues.py
+- fix_trailing_stoploss.py
+- fix_and_run.bat
+- run_tests_and_strategy.bat
+- run_strategy_filtered.bat
+- run_strategy_with_improved_websocket.bat
+- run_strategy_secure.bat
+
+## Files With Errors
+
+- C:\vs code projects\finalized strategies\fix_docstring_issue.py
+- C:\vs code projects\finalized strategies\fix_docstring_mixed_issues.py
+- C:\vs code projects\finalized strategies\fix_line_103_specific.py
+- C:\vs code projects\finalized strategies\fix_syntax_line_103_v2.py
+- C:\vs code projects\finalized strategies\archive\fix_all_docstrings.py
+- C:\vs code projects\finalized strategies\archive\fix_all_issues.py
+- C:\vs code projects\finalized strategies\archive\fix_direct.py
+- C:\vs code projects\finalized strategies\archive\fix_docstring_issue.py
+- C:\vs code projects\finalized strategies\archive\fix_docstring_mixed_issues.py
+- C:\vs code projects\finalized strategies\archive\fix_indentation.py
+- C:\vs code projects\finalized strategies\archive\fix_indent_simple.py
+- C:\vs code projects\finalized strategies\archive\fix_line_103_specific.py
+- C:\vs code projects\finalized strategies\archive\fix_line_1947.py
+- C:\vs code projects\finalized strategies\archive\fix_logging.py
+- C:\vs code projects\finalized strategies\archive\fix_missing_methods.py
+- C:\vs code projects\finalized strategies\archive\fix_specific_docstrings.py
+- C:\vs code projects\finalized strategies\archive\fix_strategy_clean.py
+- C:\vs code projects\finalized strategies\archive\fix_strategy_syntax.py
+- C:\vs code projects\finalized strategies\archive\fix_strings.py
+- C:\vs code projects\finalized strategies\archive\fix_syntax.py
+- C:\vs code projects\finalized strategies\archive\fix_syntax_issues.py
+- C:\vs code projects\finalized strategies\archive\fix_syntax_line_103_v2.py
+- C:\vs code projects\finalized strategies\archive\fix_trailing_stoploss.py
+- C:\vs code projects\finalized strategies\archive\fix_unterminated_string.py
+- C:\vs code projects\finalized strategies\utilities\fix_indentation.py
+- C:\vs code projects\finalized strategies\debug_syntax.py
+- C:\vs code projects\finalized strategies\archive\run_fixed_strategy.py.bak
+- C:\vs code projects\finalized strategies\archive\wait_and_run_strategy.py.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250728_230126.log.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250728_231234.log.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250728_231624.log.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250729_162857.log.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250729_163105.log.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250729_163126.log.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250729_163222.log.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250729_165453.log.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250729_173355.log.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250729_214621.log.bak
+- C:\vs code projects\finalized strategies\logs\strategy_20250730_174140.log.bak
+- C:\vs code projects\finalized strategies\src\fyers_api_utils.py.bak
+- C:\vs code projects\finalized strategies\backups\strategy.py.bak
+- C:\vs code projects\finalized strategies\backups\strategy.py.before_fix
+- C:\vs code projects\finalized strategies\backups\strategy.py.original
+- C:\vs code projects\finalized strategies\src\strategy.py.backup_20250730_062107
+- C:\vs code projects\finalized strategies\src\strategy.py.before_trailing_sl_fix
+- C:\vs code projects\finalized strategies\src\strategy.py.complete_fix
+- C:\vs code projects\finalized strategies\src\strategy.py.complete_syntax_fix_1753807474
+- C:\vs code projects\finalized strategies\logs\strategy_backup_20250708_224056.log
+- C:\vs code projects\finalized strategies\src\strategy.py.backup_20250730_062107
+- C:\vs code projects\finalized strategies\src\auth.py
+- C:\vs code projects\finalized strategies\src\check_fyers_api.py
+- C:\vs code projects\finalized strategies\src\clean_strategy_runner.py
+- C:\vs code projects\finalized strategies\src\config.py
+- C:\vs code projects\finalized strategies\src\dashboard.py
+- C:\vs code projects\finalized strategies\src\fetch_option_oi.py
+- C:\vs code projects\finalized strategies\src\filter_logs.py
+- C:\vs code projects\finalized strategies\src\find_debug_logs.py
+- C:\vs code projects\finalized strategies\src\fixed_improved_websocket.py
+- C:\vs code projects\finalized strategies\src\fixed_strategy.py
+- C:\vs code projects\finalized strategies\src\fyers_api_utils.py
+- C:\vs code projects\finalized strategies\src\fyers_api_utils.py.bak
+- C:\vs code projects\finalized strategies\src\fyers_api_utils_fixed.py
+- C:\vs code projects\finalized strategies\src\fyers_api_utils_updated.py
+- C:\vs code projects\finalized strategies\src\hybrid_market_data.py
+- C:\vs code projects\finalized strategies\src\improved_websocket.py
+- C:\vs code projects\finalized strategies\src\log_sanitizer.py
+- C:\vs code projects\finalized strategies\src\main.py
+- C:\vs code projects\finalized strategies\src\main_secure.py
+- C:\vs code projects\finalized strategies\src\market_utils.py
+- C:\vs code projects\finalized strategies\src\nse_data_new.py
+- C:\vs code projects\finalized strategies\src\nse_data_new_fixed.py
+- C:\vs code projects\finalized strategies\src\nse_data_new_updated.py
+- C:\vs code projects\finalized strategies\src\strategy.py
+- C:\vs code projects\finalized strategies\src\strategy.py.backup_20250730_062107
+- C:\vs code projects\finalized strategies\src\strategy.py.before_trailing_sl_fix
+- C:\vs code projects\finalized strategies\src\strategy.py.complete_fix
+- C:\vs code projects\finalized strategies\src\strategy.py.complete_syntax_fix_1753807474
+- C:\vs code projects\finalized strategies\src\strategy_fixed.py
+- C:\vs code projects\finalized strategies\src\symbol_formatter.py
+- C:\vs code projects\finalized strategies\src\test_log_filtering.py
+- C:\vs code projects\finalized strategies\src\token_helper.py
+- C:\vs code projects\finalized strategies\src\__init__.py
+

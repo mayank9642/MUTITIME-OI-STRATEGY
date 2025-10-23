@@ -1,0 +1,29 @@
+# Ignore Python cache and logs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore logs and backups
+logs/
+backups/
+cleanup_backups/
+*.log
+*.bak
+
+# Ignore config examples
+config/example_config.yaml
+
+# Ignore Jupyter notebooks
+*.ipynb
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore environment files
+.env
+
+# Ignore test outputs
+*.csv
+*.xlsx

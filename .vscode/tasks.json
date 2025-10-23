@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Verify trailing stop loss",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-c",
+				"import sys; sys.path.append('c:/vs code projects/finalized strategies'); from src.strategy import OpenInterestStrategy; strategy = OpenInterestStrategy(); print('Testing if method exists:'); print('update_trailing_stoploss method exists:' if hasattr(strategy, 'update_trailing_stoploss') else 'ERROR: update_trailing_stoploss method does not exist'); print('Test completed')"
+			],
+			"group": "test",
+			"isBackground": false
+		}
+	]
+}

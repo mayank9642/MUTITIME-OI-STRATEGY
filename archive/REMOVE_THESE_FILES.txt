@@ -1,0 +1,22 @@
+# Files That Can Be Safely Removed
+
+This document lists files that can be safely removed from the project if additional cleanup is desired.
+
+## Cache Files
+- All `__pycache__` directories and their contents
+
+## Temporary Test Files
+- Files in `tests/` directory ending with `.log`
+- `tests/websocket_test.log`
+- `tests/test_log.log`
+
+## Old Log Backups
+- All `*.log.bak` files in `backups/logs/` directory if no longer needed for reference
+
+## Archive Files
+You may choose to keep these for reference or delete them:
+- Files in `archive/` directory that are no longer needed
+- Old versions of scripts in `backups/` directory
+
+## Note:
+Always make sure you have a backup before removing any files.
