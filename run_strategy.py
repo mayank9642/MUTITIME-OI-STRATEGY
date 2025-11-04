@@ -63,7 +63,7 @@ def monkey_patch_option_symbol_conversion():
     """Apply symbol conversion to all relevant functions"""
     try:
         # Import the symbol formatter
-        from src.symbol_formatter import convert_option_symbol_format
+        from src.symbol_utils import convert_option_symbol_format
         import src.nse_data_new
         import pandas as pd
         

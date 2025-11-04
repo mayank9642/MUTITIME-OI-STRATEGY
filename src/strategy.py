@@ -18,6 +18,7 @@ from collections import defaultdict
 from src.fyers_api_utils import get_fyers_client
 from src.fixed_improved_websocket import enhanced_start_market_data_websocket
 from src.order_manager import OrderManager
+import re
 
 class OpenInterestStrategy:
     def __init__(self):
@@ -126,7 +127,7 @@ class OpenInterestStrategy:
         # For long positions, we want to move the stoploss up as price increases
         logging.info(f"TRAILING SL DEBUG | [LONG] potential_stoploss: {potential_stoploss}")
 
-        # Only update if the new stoploss is higher than both current stoploss and original stoploss
+        # Only update if the new stoploss is higher than both current stoploss and original_stoploss
         if potential_stoploss > current_sl and potential_stoploss > original_stoploss:
             old_sl = self.active_trade['stoploss']
             self.active_trade['stoploss'] = round(potential_stoploss, 3)
@@ -149,287 +150,147 @@ class OpenInterestStrategy:
             logging.info(f"TRAILING SL DEBUG | [LONG] No update: potential_stoploss ({potential_stoploss}) <= current_sl ({current_sl}) or original_stoploss ({original_stoploss})")
             return False
 
+    def validate_fyers_symbols(self, symbols):
+        """
+        Validate option symbols against Fyers master contract (or API) before subscribing.
+        Returns only valid symbols.
+        """
+        # Placeholder: In production, fetch valid symbols from Fyers API or master file
+        # For now, assume all symbols are valid except those with None or empty string
+        valid_symbols = [s for s in symbols if s and isinstance(s, str) and len(s) > 10]
+        invalid_symbols = [s for s in symbols if s not in valid_symbols]
+        if invalid_symbols:
+            logging.warning(f"Some symbols are invalid and will not be subscribed: {invalid_symbols}")
+        return valid_symbols
+
     def identify_high_oi_strikes(self):
-        """Identify strikes with highest open interest at 9:20 AM using live option chain data"""
+        """
+        Analyze option chain data to identify highest OI strikes for CE and PE.
+        Sets self.highest_call_oi_strike, self.highest_put_oi_strike, self.highest_call_oi_symbol, self.highest_put_oi_symbol,
+        self.call_breakout_level, self.put_breakout_level for trade monitoring.
+        Returns True if analysis is successful, False otherwise.
+        """
         try:
-            self.put_breakout_level = None
-            self.call_breakout_level = None
-            from src.fyers_api_utils import get_nifty_spot_price
-            from src.nse_data_new import get_nifty_option_chain
-            spot_price = get_nifty_spot_price()
-            logging.info(f"Current Nifty spot price: {spot_price}")
-            atm_strike = round(spot_price / 100) * 100
+            from src.fetch_option_oi import fetch_option_oi  # Corrected import
+            oi_data = fetch_option_oi()
+            if oi_data is None or len(oi_data) == 0:
+                logging.error("OI analysis failed: No option chain data returned.")
+                return False
+            ce_df = oi_data[oi_data['option_type'] == 'CE']
+            pe_df = oi_data[oi_data['option_type'] == 'PE']
+            if ce_df.empty or pe_df.empty:
+                logging.error("OI analysis failed: No CE or PE data available.")
+                return False
+            ce_df = ce_df[ce_df['ltp'].notnull()]
+            pe_df = pe_df[pe_df['ltp'].notnull()]
+            if ce_df.empty or pe_df.empty:
+                logging.error("OI analysis failed: No CE or PE contracts with valid LTP.")
+                return False
+            # --- Enhanced Strike Selection Logic ---
+            # Sort by OI, filter by max_strike_distance from ATM
+            spot_price = self.live_prices.get('NSE:NIFTY', None)
+            if spot_price is None:
+                spot_price = ce_df['strike'].median()  # fallback
+            atm_strike = round(spot_price / 100) * 100 if spot_price else None
             max_distance = self.max_strike_distance
             min_premium = self.min_premium_threshold
-            # --- PUT LEG ---
-            put_found = False
-            put_chain = None  # Ensure variable is always defined
-            for expiry_idx in range(3):
-                option_chain = get_nifty_option_chain(expiry_idx)
-                if option_chain is None or option_chain.empty:
-                    continue
-                put_chain = option_chain[(option_chain['option_type'] == 'PE') & (option_chain['strikePrice'] >= atm_strike - max_distance) & (option_chain['strikePrice'] <= atm_strike + max_distance)]
-                if not put_chain.empty:
-                    put_oi_sorted = put_chain.sort_values('openInterest', ascending=False)
-                    for _, row in put_oi_sorted.iterrows():
-                        strike_premium = float(row['lastPrice'])
-                        if strike_premium >= min_premium:
-                            self.highest_put_oi_strike = int(row['strikePrice'])
-                            self.put_premium_at_9_20 = strike_premium
-                            self.highest_put_oi_symbol = row['symbol']
-                            self.put_breakout_level = round(strike_premium * 1.10, 1)
-                            self.put_expiry_idx = expiry_idx
-                            put_found = True
-                            break
-                if put_found:
+            # Filter CE/PE by strike distance
+            ce_filtered = ce_df[(ce_df['strike'] >= atm_strike - max_distance) & (ce_df['strike'] <= atm_strike + max_distance)]
+            pe_filtered = pe_df[(pe_df['strike'] >= atm_strike - max_distance) & (pe_df['strike'] <= atm_strike + max_distance)]
+            # Sort by OI descending
+            ce_sorted = ce_filtered.sort_values('oi', ascending=False)
+            pe_sorted = pe_filtered.sort_values('oi', ascending=False)
+            # Select first strike with premium above threshold
+            highest_call_row = None
+            for _, row in ce_sorted.iterrows():
+                if row['ltp'] >= min_premium:
+                    highest_call_row = row
                     break
-            # --- CALL LEG ---
-            call_found = False
-            call_chain = None  # Ensure variable is always defined
-            for expiry_idx in range(3):
-                option_chain = get_nifty_option_chain(expiry_idx)
-                if option_chain is None or option_chain.empty:
-                    continue
-                # FIX: use option_chain, not call_chain, in the filter below
-                call_chain = option_chain[(option_chain['option_type'] == 'CE') & (option_chain['strikePrice'] >= atm_strike - max_distance) & (option_chain['strikePrice'] <= atm_strike + max_distance)]
-                if not call_chain.empty:
-                    call_oi_sorted = call_chain.sort_values('openInterest', ascending=False)
-                    for _, row in call_oi_sorted.iterrows():
-                        strike_premium = float(row['lastPrice'])
-                        if strike_premium >= min_premium:
-                            self.highest_call_oi_strike = int(row['strikePrice'])
-                            self.call_premium_at_9_20 = strike_premium
-                            self.highest_call_oi_symbol = row['symbol']
-                            self.call_breakout_level = round(strike_premium * 1.10, 1)
-                            self.call_expiry_idx = expiry_idx
-                            call_found = True
-                            break
-                if call_found:
+            if highest_call_row is None and not ce_sorted.empty:
+                highest_call_row = ce_sorted.iloc[0]  # fallback to highest OI
+            highest_put_row = None
+            for _, row in pe_sorted.iterrows():
+                if row['ltp'] >= min_premium:
+                    highest_put_row = row
                     break
-            logging.info(f"Selected strikes - PUT: {self.highest_put_oi_strike} (Premium: {self.put_premium_at_9_20}, Breakout: {self.put_breakout_level}, Expiry: {self.put_expiry_idx})")
-            logging.info(f"Selected strikes - CALL: {self.highest_call_oi_strike} (Premium: {self.call_premium_at_9_20}, Breakout: {self.call_breakout_level}, Expiry: {self.call_expiry_idx})")
-            return put_found or call_found
-        except Exception as e:
-            logging.error(f"Error identifying high OI strikes: {str(e)}")
-            self.put_breakout_level = None
-            self.call_breakout_level = None
-            return False
-
-    def process_exit(self, exit_reason="manual", exit_price=None):
-        """Process exit consistently for all exit types (stoploss, target, time, market close)"""
-        if not self.active_trade:
-            logging.warning("No active trade to exit")
-            return False
-        symbol = self.active_trade.get('symbol')
-        canonical_symbol = self.get_canonical_symbol(symbol) if symbol else None
-        entry_price = self.active_trade.get('entry_price')
-        exit_time_actual = datetime.now(pytz.timezone('Asia/Kolkata'))
-        quantity = self.active_trade.get('quantity')
-        # If exit_price is None (e.g., time-based exit), use last known price
-        if exit_price is None:
-            exit_price = self.live_prices.get(symbol) or self.active_trade.get('last_known_price') or entry_price
-            logging.info(f"No explicit exit price provided. Using last known price for exit: {exit_price}")
-        # Always define trailing_sl before use
-        trailing_sl = self.active_trade.get('stoploss', '')
-        # Calculate brokerage/charges (round trip)
-        brokerage, charges_breakdown = self.calculate_fyers_option_charges(entry_price, exit_price, quantity, state='maharashtra')
-        gross_pnl = (exit_price - entry_price) * quantity if exit_price is not None else 0
-        net_pnl = gross_pnl - brokerage
-        # Calculate max up/down
-        max_up = self.active_trade.get('max_up', '')
-        max_down = self.active_trade.get('max_down', '')
-        max_up_pct = self.active_trade.get('max_up_pct', '')
-        max_down_pct = self.active_trade.get('max_down_pct', '')
-        # Update trade record in history
-        idx = self.active_trade.get('trade_record_idx')
-        margin_required = entry_price * quantity
-        if idx is not None and idx < len(self.trade_history):
-            self.trade_history[idx].update({
-                'Exit DateTime': exit_time_actual.strftime('%Y-%m-%d %H:%M:%S'),
-                'Exit Price': exit_price,
-                'P&L': round(net_pnl, 2),
-                '% Gain/Loss': round((net_pnl / (entry_price * quantity)) * 100, 2) if entry_price and quantity else '',
-                'Trailing SL': trailing_sl,
-                'max up': round(max_up, 2) if isinstance(max_up, (int, float)) else '',
-                'max down': round(max_down, 2) if isinstance(max_down, (int, float)) else '',
-                'max up %': round(max_up_pct, 2) if isinstance(max_up_pct, (int, float)) else '',
-                'max down %': round(max_down_pct, 2) if isinstance(max_down_pct, (int, float)) else '',
-                'Brokerage': round(brokerage, 2),
-                'Margin Required': round(margin_required, 2),
-            })
-        logging.info(f"Exiting trade: {symbol} | Reason: {exit_reason} | Exit Price: {exit_price}")
-        logging.info(f"TRADE_EXIT | Symbol: {symbol} | Entry: {entry_price} | Exit: {exit_price} | Quantity: {quantity} | P&L: {net_pnl:.2f} ({(net_pnl / (entry_price * quantity)) * 100 if entry_price and quantity else 0:.2f}%) | MaxUP: {self.active_trade.get('max_up', 0):.2f} | MaxDN: {self.active_trade.get('max_down', 0):.2f} | Trailing SL: {self.active_trade['stoploss']} | Exit Time: {exit_time_actual.strftime('%Y-%m-%d %H:%M:%S')} | Reason: {exit_reason}")
-        self.active_trade['exit_reason'] = exit_reason
-        self.active_trade['exit_price'] = exit_price
-        self.active_trade['exit_time_actual'] = exit_time_actual
-        try:
-            self.save_trade_history()
-            logging.info("Trade history saved to file after exit.")
-            logging.info("If you have frozen the first row in Excel, it will not impact the code or data saving.")
-        except Exception as e:
-            logging.error(f"Error saving trade history after exit: {str(e)}")
-        # Unsubscribe from symbol before clearing active_trade
-        self.stop_price_monitoring(canonical_symbol)
-        # Remove symbol from live_prices to prevent further updates
-        if canonical_symbol in self.live_prices:
-            del self.live_prices[canonical_symbol]
-        self.active_trade = {}
-        logging.info("All trades exited and logged. Trade exit complete.")
-        return True
-
-    def execute_trade(self, symbol, side, entry_price):
-        """Execute the option trade with correct lot size for Nifty options"""
-        try:
-            traded_symbol = self.get_canonical_symbol(symbol)  # Ensure traded_symbol is defined early
-            qty = 75  # Nifty lot size (update if changed by exchange)
-            notional_value = entry_price * qty
-            if entry_price < self.min_premium_threshold:
-                logging.warning(f"Trade rejected: Premium value ({entry_price}) is below threshold ({self.min_premium_threshold})")
-                return None
-            if self.paper_trading:
-                logging.info(f"PAPER TRADING MODE - Symbol: {traded_symbol}, Price: {entry_price}")
-            else:
-                logging.info(f"LIVE TRADING - Symbol: {traded_symbol}, Price: {entry_price}")
-            logging.info(f"Trade Size: {qty} lots, Notional Value: {notional_value}")
-            order_response = None
-            if self.paper_trading:
-                order_response = {'s': 'ok', 'id': f'PAPER-{int(time.time())}'}
-                logging.info(f"Paper trade simulated: {traded_symbol} {side} {qty}")
-                # Log initial LTP and P&L
-                logging.info(f"TRADE_UPDATE | Symbol: {traded_symbol} | Entry: {entry_price} | LTP: {entry_price} | SL: {self.active_trade['stoploss']} | Target: {self.active_trade['target']} | P&L: 0.00 (0.00%) | MaxUP: 0.00 (0.00%) | MaxDN: 0.00 (0.00%) | Trailing SL: {self.active_trade['stoploss']}")
-            else:
-                from src.fyers_api_utils import place_market_order
-                order_response = place_market_order(self.fyers, traded_symbol, qty, side)
-            if order_response and order_response.get('s') == 'ok':
-                self.order_id = order_response.get('id')
-                if not self.entry_time:
-                    self.entry_time = datetime.now(pytz.timezone('Asia/Kolkata'))
-                exit_time = self.entry_time + timedelta(minutes=30)
-                config = self.config or {}
-                stoploss_pct = config.get('strategy', {}).get('stoploss_pct', 20)
-                risk_reward_ratio = config.get('strategy', {}).get('risk_reward_ratio', 2)
-                stoploss_factor = 1 - (stoploss_pct / 100)
-                stoploss_price = round(entry_price * stoploss_factor, 1)
-                risk_amount = entry_price - stoploss_price
-                target_gain = risk_amount * risk_reward_ratio
-                target_price = round(entry_price + target_gain, 1)
-                index = 'NIFTY'
-                direction = 'BUY' if side.upper() == 'BUY' else 'SELL'
-                margin_required = entry_price * qty
-                # Calculate brokerage for reporting (entry only, exit will be added on exit)
-                brokerage, _ = self.calculate_fyers_option_charges(entry_price, entry_price, qty, state='maharashtra')
-                trade_record = {
-                    'Entry DateTime': self.entry_time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'Index': index,
-                    'Symbol': traded_symbol,
-                    'Direction': direction,
-                    'Entry Price': entry_price,
-                    'Exit DateTime': '',
-                    'Exit Price': '',
-                    'Stop Loss': stoploss_price,
-                    'Target': target_price,
-                    'Trailing SL': '',
-                    'Quantity': qty,
-                    'Brokerage': round(brokerage, 2),
-                    'P&L': '',
-                    'Margin Required': round(margin_required, 2),
-                    '% Gain/Loss': '',
-                    'max up': '',
-                    'max down': '',
-                    'max up %': '',
-                    'max down %': '',
-                }
-                # Extract expiry, strike, option_type from traded_symbol
-                import re
-                expiry = strike = option_type = None
-                match = re.match(r"NSE:[A-Z]+(\d{2}[A-Z]\d{2})(\d+)(CE|PE)", traded_symbol)
-                if match:
-                    expiry = match.group(1)
-                    strike = int(match.group(2))
-                    option_type = match.group(3)
-                self.active_trade = {
-                    'symbol': traded_symbol,
-                    'quantity': qty,
-                    'entry_price': entry_price,
-                    'entry_time': self.entry_time,
-                    'stoploss': stoploss_price,
-                    'target': target_price,
-                    'exit_time': exit_time,
-                    'paper_trade': self.paper_trading,
-                    'trade_record_idx': len(self.trade_history),  # Track index for update on exit
-                    'expiry': expiry,
-                    'strike': strike,
-                    'option_type': option_type,
-                }
-                self.trade_taken_today = True
-                logging.info("Daily trade limit: Trade has been taken for today.")
-                logging.info(f"=== {'PAPER' if self.paper_trading else 'LIVE'} TRADE EXECUTED ===")
-                logging.info(f"Symbol: {traded_symbol}")
-                logging.info(f"Entry Price: {entry_price}")
-                logging.info(f"Quantity: {qty} lots")
-                logging.info(f"Entry Time: {self.entry_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                logging.info(f"Stoploss: {self.active_trade['stoploss']}")
-                logging.info(f"Target: {self.active_trade['target']}")
-                logging.info(f"Exit Time Limit: {self.active_trade['exit_time'].strftime('%Y-%m-%d %H:%M:%S')}")
-                logging.info(f"========================")
-                logging.info(f"Trade symbol: {traded_symbol}, Expiry index: {self.put_expiry_idx if 'PE' in traded_symbol else self.call_expiry_idx}")
-                logging.info(f"Actual premium at trade time: {entry_price}")
-                self.trade_history.append(trade_record)
-                try:
-                    self.save_trade_history()
-                except Exception as e:
-                    logging.error(f"Error saving trade history: {str(e)}")
-                symbols_to_subscribe = [traded_symbol]
-                logging.info(f"(Re)subscribing to traded option symbol for live price updates: {symbols_to_subscribe}")
-                # --- ENSURE ONLY TRADED SYMBOL IS SUBSCRIBED AFTER TRADE ENTRY ---
-                self.stop_tick_consumer()
-                # Close old WebSocket connection completely
-                if hasattr(self, 'data_socket') and hasattr(self.data_socket, 'close_connection'):
-                    try:
-                        self.data_socket.close_connection()
-                        logging.info("Closed old data socket after trade entry.")
-                    except Exception as e:
-                        logging.error(f"Error closing data socket: {e}")
-                self.data_socket = None
-                # Open a new WebSocket/data socket for only the traded symbol
-                from src.fixed_improved_websocket import enhanced_start_market_data_websocket
-                self.data_socket = enhanced_start_market_data_websocket(
-                    symbols=[traded_symbol],
-                    callback_handler=self.ws_price_update
-                )
-                self.start_tick_consumer()
-                logging.info(f"WebSocket subscription started for only traded symbol: {traded_symbol}")
-                # Clear live_prices except for traded symbol
-                self.live_prices = {traded_symbol: self.live_prices.get(traded_symbol, entry_price)}
-                logging.info(f"live_prices after trade entry: {self.live_prices}")
-                # --- FYERS MARKET DATA UNSUBSCRIBE FOR NON-TRADED SYMBOLS ---
-                symbols_to_unsubscribe = [s for s in self.live_prices.keys() if s != traded_symbol]
-                if hasattr(self, 'fyers') and hasattr(self.fyers, 'unsubscribe') and symbols_to_unsubscribe:
-                    try:
-                        self.fyers.unsubscribe(symbols=symbols_to_unsubscribe, data_type="SymbolUpdate")
-                        logging.info(f"Unsubscribed from non-traded symbols: {symbols_to_unsubscribe}")
-                    except Exception as e:
-                        logging.error(f"Error unsubscribing from non-traded symbols: {e}")
-                # --- END FYERS MARKET DATA UNSUBSCRIBE ---
-                # --- END ENSURE ONLY TRADED SYMBOL IS SUBSCRIBED ---
-                # Place broker-side stoploss order and save its ID
-                sl_side = 'SELL' if side == 'BUY' else 'BUY'
-                if not self.paper_trading:
-                    from src.fyers_api_utils import place_sl_order
-                    sl_order_response = place_sl_order(self.fyers, traded_symbol, qty, sl_side, stoploss_price)
-                    if sl_order_response and sl_order_response.get('s') == 'ok':
-                        self.stop_loss_order_id = sl_order_response.get('id')
-                        logging.info(f"Placed broker-side stoploss order: {self.stop_loss_order_id} at {stoploss_price}")
-                    else:
-                        logging.error(f"Failed to place broker-side stoploss order: {sl_order_response}")
-                self.continuous_position_monitor()
-                return True
-            else:
-                logging.error(f"Order placement failed: {order_response}")
+            if highest_put_row is None and not pe_sorted.empty:
+                highest_put_row = pe_sorted.iloc[0]  # fallback to highest OI
+            if highest_call_row is None or highest_put_row is None:
+                logging.error("OI analysis failed: No suitable CE/PE strike found above premium threshold.")
                 return False
+            self.highest_call_oi_strike = int(highest_call_row['strike'])
+            self.highest_put_oi_strike = int(highest_put_row['strike'])
+            self.highest_call_oi_symbol = highest_call_row['symbol']
+            self.highest_put_oi_symbol = highest_put_row['symbol']
+            breakout_pct = self.config.get('strategy', {}).get('breakout_pct', 10)
+            self.call_breakout_level = float(highest_call_row['ltp']) * (1 + breakout_pct / 100)
+            self.put_breakout_level = float(highest_put_row['ltp']) * (1 + breakout_pct / 100)
+            logging.info(f"OI analysis: Highest CE strike={self.highest_call_oi_strike}, symbol={self.highest_call_oi_symbol}, breakout={self.call_breakout_level}")
+            logging.info(f"OI analysis: Highest PE strike={self.highest_put_oi_strike}, symbol={self.highest_put_oi_symbol}, breakout={self.put_breakout_level}")
+            return True
         except Exception as e:
-            logging.error(f"Error executing trade: {str(e)}")
+            logging.error(f"Error in identify_high_oi_strikes: {str(e)}")
+            logging.error(traceback.format_exc())
             return False
+
+    def subscribe_to_valid_symbols(self, symbols):
+        """
+        Subscribe only to valid symbols for monitoring.
+        """
+        valid_symbols = self.validate_fyers_symbols(symbols)
+        if not valid_symbols:
+            logging.error("No valid symbols to subscribe for monitoring.")
+            return
+        # Start websocket subscription for valid symbols
+        self.data_socket = enhanced_start_market_data_websocket(valid_symbols, self.ws_price_update)
+        logging.info(f"Subscribed to valid symbols: {valid_symbols}")
+
+    def ws_price_update(self, symbol, key, ticks, raw_ticks):
+        """
+        Callback function to handle WebSocket price updates.
+        Accepts symbol, key, ticks, raw_ticks as per the callback handler's call signature.
+        Uses canonical symbol as the key for self.live_prices and logging.
+        Logs both incoming and canonical symbols for diagnostics.
+        """
+        try:
+            # --- PATCH: Ensure only exact contract is updated ---
+            canonical_symbol = self.get_canonical_symbol(symbol)
+            # Parse expiry, strike, option_type from canonical_symbol
+            match = re.match(r"NSE:[A-Z]+(\d{2}[A-Z]\d{2})(\d+)(CE|PE)", canonical_symbol)
+            expiry = strike = option_type = None
+            if match:
+                expiry = match.group(1)
+                strike = int(match.group(2))
+                option_type = match.group(3)
+            # Extract LTP from ticks (assume ticks is a dict with 'ltp')
+            ltp = ticks.get('ltp') if isinstance(ticks, dict) else None
+            if ltp is not None:
+                # Update live_prices only for the exact contract
+                self.live_prices[canonical_symbol] = ltp
+                # Update ltp_df for the exact contract
+                df_row = self.ltp_df[
+                    (self.ltp_df.symbol == canonical_symbol) &
+                    (self.ltp_df.expiry == expiry) &
+                    (self.ltp_df.strike == strike) &
+                    (self.ltp_df.option_type == option_type)
+                ]
+                if not df_row.empty:
+                    self.ltp_df.loc[df_row.index, 'ltp'] = ltp
+                else:
+                    # Insert new row for this contract
+                    new_row = {
+                        'symbol': canonical_symbol,
+                        'expiry': expiry,
+                        'strike': strike,
+                        'option_type': option_type,
+                        'ltp': ltp
+                    }
+                    self.ltp_df = pd.concat([self.ltp_df, pd.DataFrame([new_row])], ignore_index=True)
+                logging.debug(f"Tick update: {canonical_symbol} | expiry: {expiry} | strike: {strike} | type: {option_type} | ltp: {ltp}")
+            else:
+                logging.warning(f"Tick update missing LTP for {canonical_symbol}: {ticks}")
+        except Exception as e:
+            logging.error(f"Error in ws_price_update: {str(e)}")
 
     # Other essential method skeletons
     def run_diagnostic(self):
@@ -554,10 +415,7 @@ class OpenInterestStrategy:
                 if trade_symbol and trade_symbol not in symbols:
                     symbols.append(trade_symbol)
             logging.info(f"Subscribing to symbols: {symbols}")
-            self.data_socket = enhanced_start_market_data_websocket(
-                symbols=symbols,
-                callback_handler=self.ws_price_update
-            )
+            self.subscribe_to_valid_symbols(symbols)
             logging.info(f"WebSocket subscription started for symbols: {symbols}")
             logging.info("Strategy initialization complete")
             return True
@@ -675,95 +533,37 @@ class OpenInterestStrategy:
             logging.info(f"Subscribing to both option symbols for breakout monitoring: {symbols_to_monitor}")
             if not self.retry_websocket_connection(symbols_to_monitor):
                 logging.error("Could not establish websocket connection after retries. Aborting breakout monitoring.")
-                return            logging.info(f"WebSocket subscription started for symbols: {symbols_to_monitor}")
+                return            
+            logging.info(f"WebSocket subscription started for symbols: {symbols_to_monitor}")
             canonical_symbols = [self.get_canonical_symbol(s) for s in symbols_to_monitor]
             
             while True:
                 for symbol, canonical_symbol in zip(symbols_to_monitor, canonical_symbols):
-                    # Get the price from the EXACT symbol key to prevent mixups
-                    price = self.live_prices.get(canonical_symbol)
+                    # --- PATCH: Use DataFrame-based LTP for price decisions ---
+                    df_row = self.ltp_df[self.ltp_df.symbol == canonical_symbol]
+                    price = float(df_row.iloc[0]['ltp']) if not df_row.empty else None
                     breakout_level = breakout_levels[canonical_symbol]
-                    
-                    # Determine if this is a CE or PE symbol
                     option_type = "unknown"
                     if "CE" in canonical_symbol:
                         option_type = "CE"
                     elif "PE" in canonical_symbol:
                         option_type = "PE"
-                    
                     logging.info(f"MONITOR: {canonical_symbol} ({option_type}) price={price} (Breakout: {breakout_level})")
-                    
                     if price is not None:
                         if price >= breakout_level:
-                            logging.info(f"BREAKOUT DETECTED: {canonical_symbol} ({option_type}) at premium {price} >= {breakout_level}")
-                            # Execute the trade immediately when breakout is detected
-                            self.execute_trade(canonical_symbol, "BUY", price)
-                            self.unsubscribe_non_triggered_symbol(canonical_symbol, canonical_symbols)
+                            logging.info(f"Breakout detected for {canonical_symbol} ({option_type}) at price {price} >= breakout level {breakout_level}. Executing trade entry.")
+                            trade_result = self.execute_trade(symbol=canonical_symbol, side='BUY', entry_price=price)
+                            if trade_result:
+                                logging.info(f"Trade entry successful for {canonical_symbol} at price {price}.")
+                            else:
+                                logging.error(f"Trade entry failed for {canonical_symbol} at price {price}.")
+                            self.unsubscribe_non_triggered_symbol(triggered_symbol=canonical_symbol, all_symbols=symbols_to_monitor)
                             return True
                 time.sleep(2)
             return False
         except Exception as e:
             logging.error(f"Error monitoring for breakout: {str(e)}")
             return None
-
-    def continuous_position_monitor(self):
-        """Continuously monitor the position for adjustments and exits"""
-        if not self.active_trade:
-            logging.info("No active trade to monitor")
-            return
-        try:
-            symbol = self.active_trade.get('symbol')
-            exit_time = self.active_trade.get('exit_time')
-            entry_time = self.active_trade.get('entry_time')
-            while self.active_trade:
-                current_time = datetime.now(pytz.timezone('Asia/Kolkata'))
-                # Strict 30-min hard limit using entry_time
-                if entry_time and (current_time - entry_time).total_seconds() >= 30 * 60:
-                    logging.info(f"Strict 30-min limit: Exiting trade after 30 minutes.")
-                    self.process_exit(exit_reason="MAX_DURATION")
-                    break
-                # Check for exit_time (legacy logic)                if exit_time and current_time >= exit_time:
-                    logging.info("Exit time reached. Exiting position.")
-                    self.process_exit(exit_reason="time")
-                    break
-                
-                # Always get the latest LTP from the DataFrame for the active trade symbol
-                df_row = self.ltp_df[self.ltp_df.symbol == symbol]
-                if not df_row.empty:
-                    current_price = float(df_row.iloc[-1].get('ltp', 0))
-                    price_source = "DataFrame LTP"
-                else:
-                    current_price = self.live_prices.get(symbol) or self.active_trade.get('last_known_price')
-                    price_source = "live_prices/last_known_price"
-
-                if current_price:
-                    logging.info(f"Position monitor price for {symbol}: {current_price} (source: {price_source})")
-                    self.active_trade['last_known_price'] = current_price
-                    stoploss = self.active_trade.get('stoploss')
-                    target = self.active_trade.get('target')
-                    logging.info(f"SL/Target check: Current: {current_price}, SL: {stoploss}, Target: {target}")
-                    self.log_trade_update()
-                    if current_price <= stoploss:
-                        logging.info(f"Stoploss hit. Exiting position at defined stoploss: {stoploss}. Current price: {current_price}")
-                        self.process_exit(exit_reason="stoploss", exit_price=stoploss)
-                        break
-                    elif current_price >= target:
-                        logging.info(f"Target hit. Exiting position at defined target: {target}. Current price: {current_price}")
-                        self.process_exit(exit_reason="target", exit_price=target)
-                        break
-                exit_time = self.active_trade.get('exit_time')
-                if exit_time is not None and datetime.now(pytz.timezone('Asia/Kolkata')) >= exit_time:
-                    logging.info("Exit time reached. Exiting position.")
-                    self.process_exit(exit_reason="time")
-                    break
-                # If trade was exited in process_exit, break loop
-                if not self.active_trade:
-                    break
-                time.sleep(5)
-            logging.info(f"Stopped monitoring for {symbol}. Trade exited.")
-        except Exception as e:
-            logging.error(f"Error in continuous_position_monitor: {str(e)}")
-            return False
 
     def log_trade_update(self):
         """Log trade update and monitoring info after entry, including P&L, max up/down, trailing SL"""
@@ -775,8 +575,12 @@ class OpenInterestStrategy:
         target = self.active_trade.get('target')
         quantity = self.active_trade.get('quantity')
         entry_time = self.active_trade.get('entry_time')
-        # Fetch live price if available
-        current_price = self.live_prices.get(symbol) or self.active_trade.get('last_known_price', entry_price)
+        # Always use tick DataFrame LTP for the exact contract
+        current_price = self.get_active_trade_ltp()
+        if current_price is None:
+            logging.error(f"No tick DataFrame LTP available for active trade contract. Skipping trade update.")
+            return
+        logging.info(f"TRADE_UPDATE | Symbol: {symbol} | Entry: {entry_price} | LTP: {current_price} (source: tick DataFrame) | SL: {self.active_trade['stoploss']} | Target: {target}")
         # Calculate P&L
         pnl = (current_price - entry_price) * quantity
         pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price else 0
@@ -809,7 +613,7 @@ class OpenInterestStrategy:
         max_down_pct_val = float(self.active_trade.get('max_down_pct', 0) or 0)
         max_up_val = float(self.active_trade.get('max_up', 0) or 0)
         max_up_pct_val = float(self.active_trade.get('max_up_pct', 0) or 0)
-        logging.info(f"TRADE_UPDATE | Symbol: {symbol} | Entry: {entry_price} | LTP: {current_price} | SL: {self.active_trade['stoploss']} | Target: {target} | P&L: {pnl:.2f} ({pnl_pct:.2f}%) | MaxUP: {max_up_val:.2f} ({max_up_pct_val:.2f}%) | MaxDN: {max_down_val:.2f} ({max_down_pct_val:.2f}%) | Trailing SL: {self.active_trade['stoploss']}")
+        logging.info(f"TRADE_UPDATE | Symbol: {symbol} | Entry: {entry_price} | LTP: {current_price} (source: tick DataFrame) | SL: {self.active_trade['stoploss']} | Target: {target} | P&L: {pnl:.2f} ({pnl_pct:.2f}%) | MaxUP: {max_up_val:.2f} ({max_up_pct_val:.2f}%) | MaxDN: {max_down_val:.2f} ({max_down_pct_val:.2f}%) | Trailing SL: {self.active_trade['stoploss']}")
         logging.info(f"TRADE_MONITOR | Monitoring {symbol} for SL/Target/Exit conditions...")
 
     def cleanup(self):
@@ -854,111 +658,17 @@ class OpenInterestStrategy:
         if match:
             year, month, day, opt_type, strike = match.groups()
             fyers_symbol = f"NSE:NIFTY{day}{month.upper()}{year}{strike}{'CE' if opt_type=='C' else 'PE'}"
-            logging.info(f"[SYMBOL MAP] {orig_symbol} → {fyers_symbol}")
+            logging.info(f"[SYMBOL MAP] {orig_symbol} -> {fyers_symbol}")
             return fyers_symbol
         # Fallback: use convert_option_symbol_format if available
         try:
             from src.symbol_formatter import convert_option_symbol_format
             converted = convert_option_symbol_format(symbol)
-            logging.info(f"[SYMBOL MAP] {orig_symbol} → {converted}")
+            logging.info(f"[SYMBOL MAP] {orig_symbol} -> {converted}")
             return converted
         except Exception as e:
             logging.error(f"[SYMBOL MAP] Error converting {orig_symbol}: {e}")
             return symbol
-
-    def ws_price_update(self, symbol, key, ticks, raw_ticks):
-        """
-        Callback function to handle WebSocket price updates.
-        Accepts symbol, key, ticks, raw_ticks as per the callback handler's call signature.
-        Uses canonical symbol as the key for self.live_prices and logging.
-        Logs both incoming and canonical symbols for diagnostics.
-        """
-        try:
-            with self._ws_lock:  # Ensure thread safety
-                canonical_symbol = self.get_canonical_symbol(symbol)
-                ltp = ticks.get('ltp', 0)
-                # Extract expiry, strike, option_type from symbol string (assumes format: NSE:UNDERLYINGYYMMDDSTRIKEOPT)
-                import re
-                match = re.match(r"NSE:[A-Z]+(\d{2}[A-Z]\d{2})(\d+)(CE|PE)", canonical_symbol)
-                expiry = strike = option_type = None
-                if match:
-                    expiry = match.group(1)
-                    strike = int(match.group(2))
-                    option_type = match.group(3)
-                else:
-                    # fallback: try to get from ticks if available
-                    expiry = ticks.get('expiry')
-                    strike = ticks.get('strike')
-                    option_type = ticks.get('option_type')
-                logging.info(f"WS CALLBACK FULL TICK: symbol={symbol}, canonical={canonical_symbol}, expiry={expiry}, strike={strike}, option_type={option_type}, ws_ticks={ticks}")
-
-                # Save all received contract data into a DataFrame
-                tick_data = ticks.copy()
-                tick_data['symbol'] = canonical_symbol
-                tick_data['expiry'] = expiry
-                tick_data['strike'] = strike
-                tick_data['option_type'] = option_type
-                # Remove old entry if exists (match all contract details)
-                self.ltp_df = self.ltp_df[
-                    ~(
-                        (self.ltp_df.symbol == canonical_symbol) &
-                        (self.ltp_df.expiry == expiry) &
-                        (self.ltp_df.strike == strike) &
-                        (self.ltp_df.option_type == option_type)
-                    )
-                ]
-                # Append new tick data
-                self.ltp_df = pd.concat([
-                    self.ltp_df,
-                    pd.DataFrame([tick_data])
-                ], ignore_index=True)
-
-                # After trade entry, use only the required symbol's data for trade logic
-                if self.active_trade:
-                    traded_symbol = self.active_trade.get('symbol')
-                    traded_expiry = self.active_trade.get('expiry')
-                    traded_strike = self.active_trade.get('strike')
-                    traded_option_type = self.active_trade.get('option_type')
-                    # Only use tick if all contract details match
-                    if not (
-                        canonical_symbol == traded_symbol and
-                        expiry == traded_expiry and
-                        strike == traded_strike and
-                        option_type == traded_option_type
-                    ):
-                        logging.info(f"IGNORED TICK: {canonical_symbol} (not active trade contract)")
-                        return
-                    # Use only the correct contract's tick data for trade logic
-                    df_row = self.ltp_df[
-                        (self.ltp_df.symbol == traded_symbol) &
-                        (self.ltp_df.expiry == traded_expiry) &
-                        (self.ltp_df.strike == traded_strike) &
-                        (self.ltp_df.option_type == traded_option_type)
-                    ]
-                    if not df_row.empty:
-                        self.active_trade['last_known_price'] = float(df_row.iloc[0].get('ltp', 0))
-                        logging.info(f"LTP UPDATE FOR ACTIVE TRADE: {traded_symbol} {self.active_trade['last_known_price']}")
-                else:
-                    # Handle breakout detection for both CE and PE symbols
-                    option_type = None
-                    if 'CE' in canonical_symbol:
-                        option_type = 'CE'
-                    elif 'PE' in canonical_symbol:
-                        option_type = 'PE'
-                    if canonical_symbol.startswith('NSE:NIFTY') and 0 < ltp < 5000:
-                        self.live_prices[canonical_symbol] = ltp
-                        if option_type == 'CE' and hasattr(self, 'call_breakout_level') and self.call_breakout_level:
-                            if canonical_symbol == self.get_canonical_symbol(self.highest_call_oi_symbol or ''):
-                                if ltp >= self.call_breakout_level:
-                                    logging.info(f"BREAKOUT DETECTED IN CALLBACK: {canonical_symbol} (CE) at premium {ltp} >= {self.call_breakout_level}")
-                        elif option_type == 'PE' and hasattr(self, 'put_breakout_level') and self.put_breakout_level:
-                            if canonical_symbol == self.get_canonical_symbol(self.highest_put_oi_symbol or ''):
-                                if ltp >= self.put_breakout_level:
-                                    logging.info(f"BREAKOUT DETECTED IN CALLBACK: {canonical_symbol} (PE) at premium {ltp} >= {self.put_breakout_level}")
-                        logging.info(f"No active trade. Updated price for symbol: {canonical_symbol}, LTP: {ltp}")
-        except Exception as e:
-            logging.error(f"Error in ws_price_update: {e}")
-            logging.error(traceback.format_exc())
 
     def stop_price_monitoring(self, symbol=None):
         """Stop all price monitoring and unsubscribe from all symbols after trade exit."""
