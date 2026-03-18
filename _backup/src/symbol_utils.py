@@ -11,8 +11,6 @@ and use it with your project. It contains:
 import re
 import logging
 import datetime
-import time
-import traceback
 from typing import Callable
 
 # -----------------------------------------------------------
@@ -191,33 +189,22 @@ def convert_option_symbol_format(symbol: str) -> str:
 # -----------------------------------------------------------
 def get_canonical_symbol(symbol: str) -> str:
     """
-    Convert any incoming symbol to a canonical Fyers-like format with rate-limited logging.
+    Convert any incoming symbol to a canonical Fyers-like format.
 
-    This attempts several patterns and falls back to `convert_option_symbol_format`.
-    Identical mapping messages are suppressed for a short cooldown to avoid log spam.
+    This is a standalone adaptation of the logic in src/strategy.py.
+    It tries several patterns:
+    - If symbol already starts with 'NSE:' and ends with CE/PE -> return as is.
+    - Try compact NIFTY pattern: NIFTY07AUG25C24550 or NIFTY07AUG25P24550
+    - Fallback to convert_option_symbol_format if pattern doesn't match.
     """
     orig_symbol = symbol
-
-    # Module-level simple cooldown state to avoid repeated identical symbol-map logs
-    global _symbol_map_last, _symbol_map_cooldown
     try:
-        _symbol_map_last
-    except NameError:
-        _symbol_map_last = {}
-        _symbol_map_cooldown = 5
-
-    try:
-        # If already in Fyers format, return as is (rate-limited logging)
+        # If already in Fyers format, return as is
         if isinstance(symbol, str) and symbol.startswith('NSE:') and (symbol.endswith('CE') or symbol.endswith('PE')):
-            key = f"Already canonical: {symbol}"
-            now = time.time()
-            last = _symbol_map_last.get(key, 0)
-            if now - last >= _symbol_map_cooldown:
-                logging.info(f"[SYMBOL MAP] Already canonical: {symbol}")
-                _symbol_map_last[key] = now
+            logging.info(f"[SYMBOL MAP] Already canonical: {symbol}")
             return symbol
 
-        # Try compact NIFTY pattern: NIFTY07AUG25C24550 (C/P single letter)
+        # Try to match NIFTY compact options: NIFTY07AUG25C24550 (C/P single letter)
         m = re.match(r'([A-Z]+)(\d{2})([A-Z]{3})(\d{2})([CP])(\d+)$', symbol, re.IGNORECASE)
         if m:
             underlying = m.group(1).upper()
@@ -228,15 +215,10 @@ def get_canonical_symbol(symbol: str) -> str:
             strike = m.group(6)
             opt_type = 'CE' if opt_type_letter == 'C' else 'PE'
             fyers_symbol = f"NSE:{underlying}{year}{month}{day}{strike}{opt_type}"
-            key = f"{orig_symbol} -> {fyers_symbol}"
-            now = time.time()
-            last = _symbol_map_last.get(key, 0)
-            if now - last >= _symbol_map_cooldown:
-                logging.info(f"[SYMBOL MAP] {orig_symbol} -> {fyers_symbol}")
-                _symbol_map_last[key] = now
+            logging.info(f"[SYMBOL MAP] {orig_symbol} → {fyers_symbol}")
             return fyers_symbol
 
-        # Try alternate pattern with CE/PE suffix
+        # Try alternate pattern with CE/PE suffix and strike: e.g., NIFTY07AUG25C24550 or NIFTY07AUG25P24550
         m2 = re.match(r'([A-Z]+)(\d{2})([A-Z]{3})(\d{2})(CE|PE)(\d+)$', symbol, re.IGNORECASE)
         if m2:
             underlying = m2.group(1).upper()
@@ -246,27 +228,16 @@ def get_canonical_symbol(symbol: str) -> str:
             opt_type = m2.group(5).upper()
             strike = m2.group(6)
             fyers_symbol = f"NSE:{underlying}{year}{month}{day}{strike}{opt_type}"
-            key = f"{orig_symbol} -> {fyers_symbol}"
-            now = time.time()
-            last = _symbol_map_last.get(key, 0)
-            if now - last >= _symbol_map_cooldown:
-                logging.info(f"[SYMBOL MAP] {orig_symbol} -> {fyers_symbol}")
-                _symbol_map_last[key] = now
+            logging.info(f"[SYMBOL MAP] {orig_symbol} → {fyers_symbol}")
             return fyers_symbol
 
-        # Fallback: use convert_option_symbol_format
+        # Fallback: try convert_option_symbol_format
         converted = convert_option_symbol_format(symbol)
-        key = f"{orig_symbol} -> {converted}"
-        now = time.time()
-        last = _symbol_map_last.get(key, 0)
-        if now - last >= _symbol_map_cooldown:
-            logging.info(f"[SYMBOL MAP] {orig_symbol} -> {converted}")
-            _symbol_map_last[key] = now
+        logging.info(f"[SYMBOL MAP] {orig_symbol} → {converted}")
         return converted
 
     except Exception as e:
         logging.error(f"[SYMBOL MAP] Error converting {orig_symbol}: {e}")
-        logging.debug(traceback.format_exc())
         return symbol
 
 # -----------------------------------------------------------
@@ -323,7 +294,7 @@ if __name__ == "__main__":
         "NIFTY07AUG25C24550",
         "NIFTY07AUG25P24550",
         "NIFTY-07-AUG-25-24550-PE",
-    "NIFTY-10SEP25-77000-PE",
+        "BANKNIFTY-10SEP25-77000-PE",
     ]
     for s in examples:
         try:

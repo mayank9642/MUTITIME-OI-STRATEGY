@@ -1,0 +1,29 @@
+fyers:
+  access_token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiZDoxIiwiZDoyIiwieDowIiwieDoxIiwieDoyIl0sImF0X2hhc2giOiJnQUFBQUFCcHBReDFQMV9oR29hb1NiQm5ENlpzSV84Q2ZmSFdXNjBzOFJDWVlzWExBOVpwNDBoa244OVBQSTZDdU1lSzZCa21mRmVWOHM3S3dzMUM2Y3lCWF9OSGJkd2RITDJ3S1hUSEFXbkQtYWdHR2hrMzJhQT0iLCJkaXNwbGF5X25hbWUiOiIiLCJvbXMiOiJLMSIsImhzbV9rZXkiOiIzM2ViN2ViZjFiOTEwZGQ5ZTE0YzI1ZDY1MzU3NTI0YjdlZmJlOTE2ZjQzN2U4MzcwZjFmYTk4ZCIsImlzRGRwaUVuYWJsZWQiOiJOIiwiaXNNdGZFbmFibGVkIjoiTiIsImZ5X2lkIjoiWU0wNDA3NyIsImFwcFR5cGUiOjEwMCwiZXhwIjoxNzcyNDk3ODAwLCJpYXQiOjE3NzI0MjQzMDksImlzcyI6ImFwaS5meWVycy5pbiIsIm5iZiI6MTc3MjQyNDMwOSwic3ViIjoiYWNjZXNzX3Rva2VuIn0.TuDgCcu3Yl8AvH6RcwXJk_ilNhw5dHbz-8lWAek2imo
+  client_id: QZAWYQ69KZ-100
+  redirect_uri: https://trade.fyers.in/api-login/redirect-uri/index.html
+  secret_key: J02WG5J3V9
+  token_expiry: '2026-03-03 09:35:09'
+  totp_key: ''
+logging:
+  file: logs/strategy.log
+  level: INFO
+strategy:
+  analysis_time: 09:20
+  breakout_pct: 10
+  max_holding_minutes: 30
+  max_strike_distance: 500
+  min_premium_threshold: 50.0
+  partial_exits:
+  - exit_percentage: 30
+    min_profit_pct: 8
+    time_minutes: 10
+  - exit_percentage: 40
+    min_profit_pct: 12
+    time_minutes: 20
+  risk_reward_ratio: 2
+  stoploss_pct: 20
+  symbol: NSE:NIFTY50-INDEX
+  trailing_stop_pct: 8
+  trailing_trigger_pct: 12
+  use_trailing_stop: true

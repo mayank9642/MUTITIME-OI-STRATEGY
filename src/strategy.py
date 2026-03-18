@@ -40,9 +40,31 @@ class OpenInterestStrategy:
         self.entry_time = None
         self.max_strike_distance = self.config.get('strategy', {}).get('max_strike_distance', 500)
         self.trade_history = []
-        self.order_manager = OrderManager(paper_trading=self.paper_trading)
+        # Pass fyers client into OrderManager so it can call broker APIs when not in paper mode
+        try:
+            self.order_manager = OrderManager(broker_api=self.fyers, paper_trading=self.paper_trading)
+        except Exception:
+            self.order_manager = OrderManager(paper_trading=self.paper_trading)
+        # Register callback so OrderManager can notify us immediately when a GTT triggers
+        try:
+            self.order_manager.on_gtt_triggered = lambda order: threading.Thread(target=self._on_order_manager_gtt_callback, args=(order,), daemon=True).start()
+        except Exception:
+            logging.debug("Could not register on_gtt_triggered callback on order_manager")
         self._ws_lock = threading.Lock()
-        
+        # For log rate-limiting and aggregation
+        self._last_logged_ltp = {}
+        self._last_logged_time = {}
+        # Minimum seconds between WS_UPDATE logs per symbol
+        self._ws_update_min_seconds = 3
+        # Minimum absolute change in LTP to trigger a WS_UPDATE log (or percent threshold)
+        self._ws_update_min_change = 0.5
+
+        # Rate-limit PAPER STATUS logs
+        self._last_paper_status_time = 0
+        self._paper_status_min_seconds = 5
+        # When True, downgrade websocket INFO tick logs to DEBUG to avoid flooding during monitoring
+        self._suppress_ws_update_info = False
+
         # Load today's trade history if file exists
         today = datetime.now().strftime('%Y%m%d')
         excel_path = f'logs/trade_history_{today}.xlsx'
@@ -69,6 +91,36 @@ class OpenInterestStrategy:
         """
         if not self.active_trade:
             logging.warning("No active trade found when updating trailing stoploss")
+        self._paper_status_thread = None
+        self._exit_monitor_thread = None
+        
+    def start_exit_monitor(self):
+        # Start an exit monitor to watch for SL/Target hits and close the trade
+        logging.info("[EXIT MONITOR] Started for active trade")
+        while self.active_trade and not self.market_closed:
+            try:
+                current = self.get_active_trade_ltp()
+                if current is None:
+                    time.sleep(1)
+                    continue
+                sl = self.active_trade.get('stoploss')
+                tgt = self.active_trade.get('target')
+                # For long BUY trades: exit when price <= SL or >= Target
+                if sl is not None and current <= sl:
+                    self._close_active_trade(exit_reason='STOPLOSS', exit_price=current)
+                    return
+                if tgt is not None and current >= tgt:
+                    self._close_active_trade(exit_reason='TARGET', exit_price=current)
+                    return
+            except Exception:
+                logging.exception("[EXIT MONITOR] Exception in exit monitor")
+            time.sleep(1)
+        logging.info("[EXIT MONITOR] Exiting")
+        
+    def monitor_exit(self):
+        if not hasattr(self, '_exit_monitor_thread') or not getattr(self, '_exit_monitor_thread'):
+            self._exit_monitor_thread = threading.Thread(target=self.start_exit_monitor, name="ExitMonitor", daemon=True)
+            self._exit_monitor_thread.start()
             return False
 
         symbol = self.active_trade.get('symbol', '')
@@ -121,33 +173,31 @@ class OpenInterestStrategy:
         # Calculate new potential stoploss (current price - trailing percentage)
         potential_stoploss = current_price * (1 - (trailing_stop_pct / 100))
 
-        # Log debug info
-        logging.info(f"TRAILING SL DEBUG | symbol: {symbol} | entry_price: {entry_price} | current_price: {current_price} | trailing_stop_pct: {trailing_stop_pct} | current_sl: {current_sl} | original_stoploss: {original_stoploss}")
+    # ...existing code...
 
         # For long positions, we want to move the stoploss up as price increases
-        logging.info(f"TRAILING SL DEBUG | [LONG] potential_stoploss: {potential_stoploss}")
+    # ...existing code...
 
         # Only update if the new stoploss is higher than both current stoploss and original_stoploss
         if potential_stoploss > current_sl and potential_stoploss > original_stoploss:
             old_sl = self.active_trade['stoploss']
             self.active_trade['stoploss'] = round(potential_stoploss, 3)
             self.active_trade['trailing_stoploss'] = round(potential_stoploss, 3)
-
-            logging.info(f"Trailing stoploss updated from {old_sl} to {self.active_trade['stoploss']}")
+            logging.info(f"[TRAILING_SL][UPDATE] Trailing stoploss updated from {old_sl} to {self.active_trade['stoploss']}")
             # --- Broker-side trailing stoploss update ---
             if not self.paper_trading and hasattr(self, 'stop_loss_order_id') and self.stop_loss_order_id:
                 try:
                     from src.fyers_api_utils import modify_order
                     response = modify_order(self.fyers, self.stop_loss_order_id, stop_price=self.active_trade['stoploss'])
                     if response and response.get('s') == 'ok':
-                        logging.info(f"Broker stoploss order modified: {self.stop_loss_order_id} to {self.active_trade['stoploss']}")
+                        logging.info(f"[TRAILING_SL][BROKER] Broker stoploss order modified: {self.stop_loss_order_id} to {self.active_trade['stoploss']}")
                     else:
-                        logging.error(f"Failed to modify broker stoploss order: {response}")
+                        logging.error(f"[TRAILING_SL][BROKER][ERROR] Failed to modify broker stoploss order: {response}")
                 except Exception as e:
-                    logging.error(f"Exception while modifying broker stoploss order: {e}")
+                    logging.error(f"[TRAILING_SL][BROKER][ERROR] Exception while modifying broker stoploss order: {e}")
             return True
         else:
-            logging.info(f"TRAILING SL DEBUG | [LONG] No update: potential_stoploss ({potential_stoploss}) <= current_sl ({current_sl}) or original_stoploss ({original_stoploss})")
+            # ...existing code...
             return False
 
     def validate_fyers_symbols(self, symbols):
@@ -159,6 +209,7 @@ class OpenInterestStrategy:
         # For now, assume all symbols are valid except those with None or empty string
         valid_symbols = [s for s in symbols if s and isinstance(s, str) and len(s) > 10]
         invalid_symbols = [s for s in symbols if s not in valid_symbols]
+    # ...existing code...
         if invalid_symbols:
             logging.warning(f"Some symbols are invalid and will not be subscribed: {invalid_symbols}")
         return valid_symbols
@@ -171,52 +222,61 @@ class OpenInterestStrategy:
         Returns True if analysis is successful, False otherwise.
         """
         try:
-            from src.fetch_option_oi import fetch_option_oi  # Corrected import
-            oi_data = fetch_option_oi()
+            from src.fetch_option_oi_fyers import fetch_option_oi_fyers
+            oi_data = fetch_option_oi_fyers(self.fyers, symbol="NSE:NIFTY50-INDEX", strikecount=20)
             if oi_data is None or len(oi_data) == 0:
-                logging.error("OI analysis failed: No option chain data returned.")
+                logging.error("[OI_ANALYSIS][ERROR] No option chain data returned from Fyers.")
                 return False
+            # ...existing code...
             ce_df = oi_data[oi_data['option_type'] == 'CE']
             pe_df = oi_data[oi_data['option_type'] == 'PE']
             if ce_df.empty or pe_df.empty:
-                logging.error("OI analysis failed: No CE or PE data available.")
+                logging.error("[OI_ANALYSIS][ERROR] No CE or PE data available.")
+                logging.debug("[OI_ANALYSIS][DEBUG] ce_df empty? %s; pe_df empty? %s", ce_df.empty, pe_df.empty)
                 return False
             ce_df = ce_df[ce_df['ltp'].notnull()]
             pe_df = pe_df[pe_df['ltp'].notnull()]
             if ce_df.empty or pe_df.empty:
-                logging.error("OI analysis failed: No CE or PE contracts with valid LTP.")
+                logging.error("[OI_ANALYSIS][ERROR] No CE or PE contracts with valid LTP.")
+                logging.debug("[OI_ANALYSIS][DEBUG] ce_df.head():\n%s", ce_df.head().to_string())
+                logging.debug("[OI_ANALYSIS][DEBUG] pe_df.head():\n%s", pe_df.head().to_string())
                 return False
             # --- Enhanced Strike Selection Logic ---
-            # Sort by OI, filter by max_strike_distance from ATM
             spot_price = self.live_prices.get('NSE:NIFTY', None)
             if spot_price is None:
                 spot_price = ce_df['strike'].median()  # fallback
             atm_strike = round(spot_price / 100) * 100 if spot_price else None
             max_distance = self.max_strike_distance
             min_premium = self.min_premium_threshold
-            # Filter CE/PE by strike distance
             ce_filtered = ce_df[(ce_df['strike'] >= atm_strike - max_distance) & (ce_df['strike'] <= atm_strike + max_distance)]
             pe_filtered = pe_df[(pe_df['strike'] >= atm_strike - max_distance) & (pe_df['strike'] <= atm_strike + max_distance)]
-            # Sort by OI descending
             ce_sorted = ce_filtered.sort_values('oi', ascending=False)
             pe_sorted = pe_filtered.sort_values('oi', ascending=False)
-            # Select first strike with premium above threshold
             highest_call_row = None
             for _, row in ce_sorted.iterrows():
                 if row['ltp'] >= min_premium:
                     highest_call_row = row
                     break
             if highest_call_row is None and not ce_sorted.empty:
-                highest_call_row = ce_sorted.iloc[0]  # fallback to highest OI
+                highest_call_row = ce_sorted.iloc[0]
             highest_put_row = None
             for _, row in pe_sorted.iterrows():
                 if row['ltp'] >= min_premium:
                     highest_put_row = row
                     break
             if highest_put_row is None and not pe_sorted.empty:
-                highest_put_row = pe_sorted.iloc[0]  # fallback to highest OI
+                highest_put_row = pe_sorted.iloc[0]
             if highest_call_row is None or highest_put_row is None:
-                logging.error("OI analysis failed: No suitable CE/PE strike found above premium threshold.")
+                logging.error("[OI_ANALYSIS][ERROR] No suitable CE/PE strike found above premium threshold.")
+                # Emit helpful debug info to diagnose why selection failed
+                try:
+                    logging.debug("[OI_ANALYSIS][DEBUG] atm_strike=%s, max_distance=%s, min_premium=%s", atm_strike, max_distance, min_premium)
+                    logging.debug("[OI_ANALYSIS][DEBUG] ce_filtered.head():\n%s", ce_filtered.head().to_string())
+                    logging.debug("[OI_ANALYSIS][DEBUG] pe_filtered.head():\n%s", pe_filtered.head().to_string())
+                    logging.debug("[OI_ANALYSIS][DEBUG] ce_sorted.head():\n%s", ce_sorted.head().to_string())
+                    logging.debug("[OI_ANALYSIS][DEBUG] pe_sorted.head():\n%s", pe_sorted.head().to_string())
+                except Exception:
+                    logging.exception("[OI_ANALYSIS][DEBUG] Failed to dump debug frames for OI analysis")
                 return False
             self.highest_call_oi_strike = int(highest_call_row['strike'])
             self.highest_put_oi_strike = int(highest_put_row['strike'])
@@ -225,11 +285,14 @@ class OpenInterestStrategy:
             breakout_pct = self.config.get('strategy', {}).get('breakout_pct', 10)
             self.call_breakout_level = float(highest_call_row['ltp']) * (1 + breakout_pct / 100)
             self.put_breakout_level = float(highest_put_row['ltp']) * (1 + breakout_pct / 100)
-            logging.info(f"OI analysis: Highest CE strike={self.highest_call_oi_strike}, symbol={self.highest_call_oi_symbol}, breakout={self.call_breakout_level}")
-            logging.info(f"OI analysis: Highest PE strike={self.highest_put_oi_strike}, symbol={self.highest_put_oi_symbol}, breakout={self.put_breakout_level}")
+            logging.info(
+                "OI_ANALYSIS: CE Strike=%s Symbol=%s Breakout=%.2f | PE Strike=%s Symbol=%s Breakout=%.2f",
+                self.highest_call_oi_strike, self.highest_call_oi_symbol, self.call_breakout_level,
+                self.highest_put_oi_strike, self.highest_put_oi_symbol, self.put_breakout_level
+            )
             return True
         except Exception as e:
-            logging.error(f"Error in identify_high_oi_strikes: {str(e)}")
+            logging.error(f"[OI_ANALYSIS][ERROR] Exception: {str(e)}")
             logging.error(traceback.format_exc())
             return False
 
@@ -237,13 +300,34 @@ class OpenInterestStrategy:
         """
         Subscribe only to valid symbols for monitoring.
         """
+        # Do not allow subscriptions until breakout levels are fixed and it's >= 09:20
+        try:
+            ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+            pid = os.getpid()
+            analysis_time = datetime.strptime("09:20", "%H:%M").time()
+            if not getattr(self, 'breakout_levels_fixed', False):
+                logging.warning(f"[WS][BLOCKED] Attempted to subscribe to symbols before OI analysis completed. Subscription skipped.")
+                return False
+            if ist_now.time() < analysis_time:
+                logging.warning(f"[WS][BLOCKED] Attempted to subscribe before 09:20. Current time: {ist_now.time().strftime('%H:%M:%S')} - subscription skipped.")
+                return False
+        except Exception:
+            # If timezone/time check fails for any reason, be conservative and block subscription
+            logging.warning("[WS][BLOCKED] Time check failed; subscription blocked as a safety measure.")
+            return False
+
         valid_symbols = self.validate_fyers_symbols(symbols)
         if not valid_symbols:
             logging.error("No valid symbols to subscribe for monitoring.")
             return
         # Start websocket subscription for valid symbols
         self.data_socket = enhanced_start_market_data_websocket(valid_symbols, self.ws_price_update)
-        logging.info(f"Subscribed to valid symbols: {valid_symbols}")
+        logging.info(f"[WS][SUBSCRIBE] Subscribed to valid symbols: {valid_symbols}")
+        # Start the tick consumer if available
+        try:
+            self.start_tick_consumer()
+        except Exception:
+            logging.debug("[WS][SUBSCRIBE] start_tick_consumer failed or not available")
 
     def ws_price_update(self, symbol, key, ticks, raw_ticks):
         """
@@ -253,21 +337,70 @@ class OpenInterestStrategy:
         Logs both incoming and canonical symbols for diagnostics.
         """
         try:
-            # --- PATCH: Ensure only exact contract is updated ---
             canonical_symbol = self.get_canonical_symbol(symbol)
-            # Parse expiry, strike, option_type from canonical_symbol
-            match = re.match(r"NSE:[A-Z]+(\d{2}[A-Z]\d{2})(\d+)(CE|PE)", canonical_symbol)
+            canonical_symbol = canonical_symbol.strip()
+            # ...existing code...
+            # Try to extract expiry/strike/type from the canonical symbol.
+            # Accept forms with or without the 'NSE:' prefix and CE/PE or single-letter C/P suffix.
             expiry = strike = option_type = None
-            if match:
-                expiry = match.group(1)
-                strike = int(match.group(2))
-                option_type = match.group(3)
-            # Extract LTP from ticks (assume ticks is a dict with 'ltp')
+            # Try a couple of known patterns. Some feeds place the option type before the strike
+            # (e.g. NIFTY17MAR26C23500) and some after (e.g. NIFTY17MAR2623500CE). Try both.
+            parsed = None
+            # Pattern 1: strike then option suffix (e.g. ...<strike><CE|PE>)
+            pat1 = re.compile(r"(?:NSE:)?(NIFTY|BANKNIFTY)(\d{2})([A-Z]{3})(\d{2})(\d{4,5})(C(?:E)?|P(?:E)?)$")
+            # Pattern 2: option letter then strike (e.g. ...<C|P><strike>)
+            pat2 = re.compile(r"(?:NSE:)?(NIFTY|BANKNIFTY)(\d{2})([A-Z]{3})(\d{2})(C(?:E)?|P(?:E)?)(\d{4,5})$")
+
+            m = pat1.match(canonical_symbol)
+            if m:
+                # groups: underlying, day, mon, year, strike, opt_type
+                day = m.group(2)
+                mon = m.group(3)
+                yr = m.group(4)
+                expiry = f"{day}{mon}{yr}"
+                try:
+                    strike = int(m.group(5))
+                except Exception:
+                    strike = None
+                opt = m.group(6)
+                option_type = 'CE' if opt.upper().startswith('C') else 'PE'
+                underlying = m.group(1).upper()
+                if strike is not None:
+                    canonical_symbol = f"NSE:{underlying}{expiry}{str(strike).zfill(5)}{option_type}"
+            else:
+                m2 = pat2.match(canonical_symbol)
+                if m2:
+                    # groups: underlying, day, mon, year, opt_type, strike
+                    day = m2.group(2)
+                    mon = m2.group(3)
+                    yr = m2.group(4)
+                    expiry = f"{day}{mon}{yr}"
+                    opt = m2.group(5)
+                    option_type = 'CE' if opt.upper().startswith('C') else 'PE'
+                    try:
+                        strike = int(m2.group(6))
+                    except Exception:
+                        strike = None
+                    underlying = m2.group(1).upper()
+                    if strike is not None:
+                        canonical_symbol = f"NSE:{underlying}{expiry}{str(strike).zfill(5)}{option_type}"
+                else:
+                    # As a last resort, try a looser parse (digits + month + digits) to salvage values
+                    loose = re.search(r"(\d{2})([A-Z]{3})(\d{2})(\d{4,5})", canonical_symbol)
+                    if loose:
+                        day, mon, yr, st = loose.groups()
+                        expiry = f"{day}{mon}{yr}"
+                        try:
+                            strike = int(st)
+                        except Exception:
+                            strike = None
+                        # Option type still unknown in this fallback
+                        option_type = None
+                    # else leave expiry/strike/type as None
             ltp = ticks.get('ltp') if isinstance(ticks, dict) else None
+            # ...existing code...
             if ltp is not None:
-                # Update live_prices only for the exact contract
                 self.live_prices[canonical_symbol] = ltp
-                # Update ltp_df for the exact contract
                 df_row = self.ltp_df[
                     (self.ltp_df.symbol == canonical_symbol) &
                     (self.ltp_df.expiry == expiry) &
@@ -277,7 +410,6 @@ class OpenInterestStrategy:
                 if not df_row.empty:
                     self.ltp_df.loc[df_row.index, 'ltp'] = ltp
                 else:
-                    # Insert new row for this contract
                     new_row = {
                         'symbol': canonical_symbol,
                         'expiry': expiry,
@@ -286,9 +418,45 @@ class OpenInterestStrategy:
                         'ltp': ltp
                     }
                     self.ltp_df = pd.concat([self.ltp_df, pd.DataFrame([new_row])], ignore_index=True)
-                logging.debug(f"Tick update: {canonical_symbol} | expiry: {expiry} | strike: {strike} | type: {option_type} | ltp: {ltp}")
+                # Rate-limit WS_UPDATE logs: log only on meaningful LTP change or once every configured interval
+                try:
+                    now = time.time()
+                    last_ltp = self._last_logged_ltp.get(canonical_symbol)
+                    last_time = self._last_logged_time.get(canonical_symbol, 0)
+                    should_log = False
+                    if last_ltp is None:
+                        should_log = True
+                    else:
+                        # Absolute change threshold or percent-based threshold can be used
+                        if abs(ltp - float(last_ltp)) >= self._ws_update_min_change:
+                            should_log = True
+                        elif (now - last_time) >= self._ws_update_min_seconds:
+                            should_log = True
+
+                        if should_log:
+                            # If monitoring is active or suppression flag set, keep these as DEBUG to avoid flooding
+                            msg = f"[WS_UPDATE] Updated {canonical_symbol} | expiry: {expiry} | strike: {strike} | type: {option_type} | ltp: {ltp}"
+                            if getattr(self, '_suppress_ws_update_info', False):
+                                logging.debug(msg)
+                            else:
+                                if expiry is not None and strike is not None and option_type is not None:
+                                    logging.info(msg)
+                                else:
+                                    logging.debug(msg)
+                        self._last_logged_ltp[canonical_symbol] = ltp
+                        self._last_logged_time[canonical_symbol] = now
+                except Exception:
+                    # Fallback to always log if anything goes wrong with rate-limiter
+                    msg = f"[WS_UPDATE] Updated {canonical_symbol} | expiry: {expiry} | strike: {strike} | type: {option_type} | ltp: {ltp}"
+                    if getattr(self, '_suppress_ws_update_info', False):
+                        logging.debug(msg)
+                    else:
+                        if expiry is not None and strike is not None and option_type is not None:
+                            logging.info(msg)
+                        else:
+                            logging.debug(msg)
             else:
-                logging.warning(f"Tick update missing LTP for {canonical_symbol}: {ticks}")
+                logging.warning(f"[WS_TICK][WARN] Tick update missing LTP for {canonical_symbol}: {ticks}")
         except Exception as e:
             logging.error(f"Error in ws_price_update: {str(e)}")
 
@@ -302,6 +470,7 @@ class OpenInterestStrategy:
         """Save trade history to both CSV and Excel files with proper error handling and column order"""
         import pandas as pd
         from datetime import date
+        import datetime as _dt
         try:
             # Define required columns in order
             columns = [
@@ -320,6 +489,27 @@ class OpenInterestStrategy:
             # Save to Excel with today's date
             today = date.today().strftime('%Y%m%d')
             excel_path = f'logs/trade_history_{today}.xlsx'
+            # Excel does not support timezone-aware datetimes. Convert any timezone-aware
+            # datetime columns to naive datetimes by removing tzinfo to avoid write errors.
+            def _drop_tz(v):
+                try:
+                    if isinstance(v, _dt.datetime) and v.tzinfo is not None:
+                        return v.replace(tzinfo=None)
+                except Exception:
+                    pass
+                return v
+
+            for col in ['Entry DateTime', 'Exit DateTime']:
+                if col in df.columns:
+                    try:
+                        df[col] = df[col].apply(_drop_tz)
+                    except Exception:
+                        # Best-effort: if conversion fails, coerce via pandas to_datetime then drop tz
+                        try:
+                            df[col] = pd.to_datetime(df[col]).apply(lambda x: x.replace(tzinfo=None) if getattr(x, 'tzinfo', None) is not None else x)
+                        except Exception:
+                            logging.debug(f"Could not sanitize timezone for column {col}")
+
             with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False)
             logging.info(f"Trade history saved to CSV and Excel: {excel_path}")
@@ -340,23 +530,21 @@ class OpenInterestStrategy:
             analysis_time = datetime.strptime("09:20", "%H:%M").time()
             # Wait for market open (09:15)
             while current_time < market_open_time:
-                mins, secs = divmod((datetime.combine(ist_now.date(), market_open_time) - datetime.combine(ist_now.date(), current_time)).total_seconds(), 60)
-                logging.info(f"Market not open yet. Waiting... Current time: {current_time.strftime('%H:%M:%S')}, Market opens in: {int(mins)}m {int(secs)}s")
-                time.sleep(10)
+                logging.info(f"Waiting for market to open (09:15 IST)... Current time: {current_time.strftime('%H:%M:%S')}")
+                time.sleep(30)
                 ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
                 current_time = ist_now.time()
-            logging.info("Market is now open. Waiting for 9:20 to perform OI analysis...")
-            # Wait for 9:20
-            while current_time < analysis_time:
-                mins, secs = divmod((datetime.combine(ist_now.date(), analysis_time) - datetime.combine(ist_now.date(), current_time)).total_seconds(), 60)
-                logging.info(f"Waiting for 9:20... Current time: {current_time.strftime('%H:%M:%S')}, OI analysis in: {int(mins)}m {int(secs)}s")
-                time.sleep(10)
-                ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
-                current_time = ist_now.time()
-            logging.info("It's 9:20 or later. Running strategy and OI analysis...")
-            return self.run_strategy(force_analysis=True)
+            # At market open, compute time until analysis (9:20) and log a single wait message similar to the sample logs
+            secs_to_analysis = int((datetime.combine(ist_now.date(), analysis_time) - datetime.combine(ist_now.date(), current_time)).total_seconds())
+            if secs_to_analysis > 0:
+                logging.info(f"Waiting {secs_to_analysis} seconds until 9:20 IST for first 5-min candle to form...")
+                # Sleep until analysis_time (keep simple and blocking to match the single-message behaviour)
+                time.sleep(secs_to_analysis)
+            logging.info("[MARKET][INFO] It's 9:20 or later. Ready to run strategy and OI analysis.")
+            # Do NOT call run_strategy here. Just return control to caller.
+            return {"success": True, "message": "Market open and 9:20 reached. Ready for OI analysis."}
         except Exception as e:
-            logging.error(f"Error in wait_for_market_open: {str(e)}")
+            logging.error(f"[MARKET][ERROR] Error in wait_for_market_open: {str(e)}")
             logging.error(traceback.format_exc())
             return {"success": False, "error": str(e)}
 
@@ -373,12 +561,12 @@ class OpenInterestStrategy:
                 if os.path.getsize(log_file) > 0:
                     with open(log_file, 'r') as src, open(backup_file, 'w') as dst:
                         dst.write(src.read())
-                    logging.info(f"Log file backed up to {backup_file}")
+                    logging.info(f"[LOG][BACKUP] Log file backed up to {backup_file}")
                     
                 # Clear the current log file
                 with open(log_file, 'w') as f:
                     f.write(f"Log file cleared on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                logging.info("Log file has been cleared for new trading day")
+                logging.info("[LOG][CLEAR] Log file has been cleared for new trading day")
                 return True
             return False
         except Exception as e:
@@ -391,7 +579,7 @@ class OpenInterestStrategy:
             # Clear logs for a fresh start
             self.clear_logs()
             
-            logging.info("Initializing strategy for the day")
+            logging.info("STRATEGY INIT: Initializing strategy for the day")
             # Reset daily state variables
             self.trade_taken_today = False
             self.market_closed = False
@@ -402,25 +590,10 @@ class OpenInterestStrategy:
             
             # Clear any active trades from previous day
             self.active_trade = {}
-            
-            # --- WebSocket subscription for all relevant symbols ---
-            # Remove index subscription: only subscribe to options needed for breakout monitoring
-            symbols = []
-            if hasattr(self, 'highest_put_oi_symbol') and self.highest_put_oi_symbol:
-                symbols.append(self.highest_put_oi_symbol)
-            if hasattr(self, 'highest_call_oi_symbol') and self.highest_call_oi_symbol:
-                symbols.append(self.highest_call_oi_symbol)
-            if self.active_trade and 'symbol' in self.active_trade:
-                trade_symbol = self.active_trade['symbol']
-                if trade_symbol and trade_symbol not in symbols:
-                    symbols.append(trade_symbol)
-            logging.info(f"Subscribing to symbols: {symbols}")
-            self.subscribe_to_valid_symbols(symbols)
-            logging.info(f"WebSocket subscription started for symbols: {symbols}")
-            logging.info("Strategy initialization complete")
+            # Do NOT subscribe to symbols here; defer until after market open and OI analysis
             return True
         except Exception as e:
-            logging.error(f"Error initializing strategy for the day: {str(e)}")
+            logging.error(f"[INIT][ERROR] Error initializing strategy for the day: {str(e)}")
             logging.error(traceback.format_exc())
             return False
 
@@ -440,7 +613,7 @@ class OpenInterestStrategy:
             dict: Result of strategy execution with success status and message
         """
         try:
-            logging.info("Running Open Interest Option Buying Strategy")
+            logging.info("STRATEGY START: Running Open Interest Option Buying Strategy")
             # Get current time in IST
             ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
             current_time = ist_now.time()
@@ -448,43 +621,76 @@ class OpenInterestStrategy:
             market_close_time = datetime.strptime("15:30", "%H:%M").time()
             # Check if market is closed
             if self.market_closed or current_time >= market_close_time:
-                logging.info("Market is closed. Skipping strategy execution.")
+                logging.info("[STRATEGY][INFO] Market is closed. Skipping strategy execution.")
                 return {"success": False, "message": "Market closed"}
             # Check if today is a weekday
             if ist_now.weekday() > 4:
-                logging.info("Today is weekend. Market closed.")
+                logging.info("[STRATEGY][INFO] Today is weekend. Market closed.")
                 return {"success": False, "message": "Weekend"}
             # Check if trade already taken today
             if self.trade_taken_today and not force_analysis:
-                logging.info("Trade already taken today. Skipping strategy execution.")
+                logging.info("[STRATEGY][INFO] Trade already taken today. Skipping strategy execution.")
                 return {"success": True, "message": "Trade already taken today"}
             # Wait for market open if needed
             if current_time < market_open_time:
-                logging.info("Market not open yet. Waiting for market open...")
+                logging.info("[STRATEGY][INFO] Market not open yet. Waiting for market open...")
                 return self.wait_for_market_open()
-            # Step 1: OI analysis at/after 9:20
+            # Wait for 9:20 before running OI analysis and breakout monitoring
             analysis_time = datetime.strptime("09:20", "%H:%M").time()
+            # Add a small tolerance to avoid race conditions around the exact second boundary
+            remaining_secs = (datetime.combine(ist_now.date(), analysis_time) - datetime.combine(ist_now.date(), current_time)).total_seconds()
+            if remaining_secs > 1 and not force_analysis:
+                mins, secs = divmod(remaining_secs, 60)
+                logging.info(f"[STRATEGY][INFO] Waiting for 9:20... Current time: {current_time.strftime('%H:%M:%S')}, OI analysis in: {int(mins)}m {int(secs)}s")
+                return {"success": False, "message": "Waiting for 9:20"}
+            # Step 1: OI analysis at/after 9:20
             if force_analysis or (current_time >= analysis_time):
-                logging.info("Performing OI analysis...")
-                oi_result = self.identify_high_oi_strikes()
-                if not oi_result:
-                    logging.error("OI analysis failed. Exiting strategy run.")
-                    return {"success": False, "message": "OI analysis failed"}
-                logging.info(f"Breakout levels: PUT={self.put_breakout_level}, CALL={self.call_breakout_level}")
-                # --- Original Trade Entry Logic ---                # Allow trade if either leg is valid (not both required)
+                if not getattr(self, 'breakout_levels_fixed', False):
+                    oi_result = self.identify_high_oi_strikes()
+                    if not oi_result:
+                        logging.error("[STRATEGY][ERROR] OI analysis failed. Exiting strategy run.")
+                        return {"success": False, "message": "OI analysis failed"}
+                    self.breakout_levels_fixed = True
+                # --- Original Trade Entry Logic ---
                 if (self.highest_call_oi_symbol and self.call_breakout_level) or (self.highest_put_oi_symbol and self.put_breakout_level):
+                    # Subscribe to valid symbols for monitoring only after OI analysis and after market open
+                    symbols = []
+                    if hasattr(self, 'highest_put_oi_symbol') and self.highest_put_oi_symbol:
+                        symbols.append(self.highest_put_oi_symbol)
+                    if hasattr(self, 'highest_call_oi_symbol') and self.highest_call_oi_symbol:
+                        symbols.append(self.highest_call_oi_symbol)
+                    if self.active_trade and 'symbol' in self.active_trade:
+                        trade_symbol = self.active_trade['symbol']
+                        if trade_symbol and trade_symbol not in symbols:
+                            symbols.append(trade_symbol)
+                    # Place OCO GTT orders for both legs (CE and PE) so that the first to trigger cancels the other
+                    try:
+                        qty = int(self.config.get('strategy', {}).get('quantity', 25))
+                    except Exception:
+                        qty = 25
+                    try:
+                        ce_sym = getattr(self, 'highest_call_oi_symbol', None)
+                        pe_sym = getattr(self, 'highest_put_oi_symbol', None)
+                        # Only place OCO if both symbols are available
+                        if ce_sym and pe_sym:
+                            logging.info(f"[OCO][PLACE] Placing OCO BRACKET orders for CE:{ce_sym} @ {self.call_breakout_level} and PE:{pe_sym} @ {self.put_breakout_level}")
+                            # Place simulated bracket OCO orders (entry limit = breakout level)
+                            self.place_oco_bracket_orders(ce_symbol=ce_sym, ce_entry=self.call_breakout_level,
+                                                          pe_symbol=pe_sym, pe_entry=self.put_breakout_level,
+                                                          qty=qty)
+                        else:
+                            logging.info("[OCO][SKIP] Not enough symbols to place OCO orders (need both CE and PE).")
+                    except Exception:
+                        logging.exception("[OCO][ERROR] Failed to place OCO GTT orders")
+                    self.subscribe_to_valid_symbols(symbols)
                     breakout_detected = self.monitor_for_breakout()
-                    if breakout_detected:
-                        logging.info("Breakout detected and trade executed successfully")
-                    else:
-                        logging.info("No breakout detected during monitoring period")
+                    # Only log trade entry in monitor_for_breakout/execute_trade
                 else:
-                    logging.warning("Trade entry skipped: missing symbol or breakout level.")
+                    logging.warning("[STRATEGY][WARN] Trade entry skipped: missing symbol or breakout level.")
             # Position management is handled by continuous_position_monitor thread
-            logging.info("Strategy execution completed successfully")
             return {"success": True, "message": "Strategy executed successfully"}
         except Exception as e:
-            logging.error(f"Error in run_strategy: {str(e)}")
+            logging.error(f"[STRATEGY][ERROR] Exception: {str(e)}")
             logging.error(traceback.format_exc())
             return {"success": False, "error": str(e)}
             
@@ -495,9 +701,9 @@ class OpenInterestStrategy:
         if hasattr(self.data_socket, 'unsubscribe'):
             for s in non_triggered:
                 self.data_socket.unsubscribe(s)
-                logging.info(f"Unsubscribed from {s} after trade triggered for {triggered_symbol}")
+                logging.info(f"[WS][UNSUBSCRIBE] Unsubscribed from {s} after trade triggered for {triggered_symbol}")
         else:
-            logging.warning("WebSocket unsubscribe method not available. Manual unsubscribe required.")
+            logging.warning("[WS][UNSUBSCRIBE][WARN] WebSocket unsubscribe method not available. Manual unsubscribe required.")
 
     def retry_websocket_connection(self, symbols, max_retries=3, delay=5):
         """Retry websocket connection if it fails."""
@@ -507,39 +713,81 @@ class OpenInterestStrategy:
                     symbols=symbols,
                     callback_handler=self.ws_price_update
                 )
-                logging.info(f"WebSocket connection established on attempt {attempt} for symbols: {symbols}")
+                logging.info(f"[WS][RETRY] WebSocket connection established on attempt {attempt} for symbols: {symbols}")
                 return True
             except Exception as e:
-                logging.error(f"WebSocket connection attempt {attempt} failed: {str(e)}")
+                logging.error(f"[WS][RETRY][ERROR] WebSocket connection attempt {attempt} failed: {str(e)}")
                 time.sleep(delay)
-        logging.error(f"All {max_retries} websocket connection attempts failed for symbols: {symbols}")
+        logging.error(f"[WS][RETRY][ERROR] All {max_retries} websocket connection attempts failed for symbols: {symbols}")
         return False
 
     def monitor_for_breakout(self):
         """Continuously monitor both CE and PE option premiums for breakout using websocket for real-time data"""
         try:
-            logging.info("Monitoring for breakout on both CE and PE...")
+            # Enforce: Do not monitor before market open (09:15) or before 9:20
+            ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+            current_time = ist_now.time()
+            market_open_time = datetime.strptime("09:15", "%H:%M").time()
+            analysis_time = datetime.strptime("09:20", "%H:%M").time()
+            if current_time < market_open_time:
+                logging.warning(f"[MONITOR][BLOCKED] Attempted to start monitoring before market open (09:15). Current time: {current_time.strftime('%H:%M:%S')}")
+                return False
+            if current_time < analysis_time:
+                logging.warning(f"[MONITOR][BLOCKED] Attempted to start monitoring before 9:20. Current time: {current_time.strftime('%H:%M:%S')}")
+                return False
+            # Ensure breakout levels have been fixed by OI analysis before monitoring
+            if not getattr(self, 'breakout_levels_fixed', False):
+                logging.warning(f"[MONITOR][BLOCKED] Attempted to start monitoring before breakout levels were fixed by OI analysis. Monitoring skipped.")
+                return False
+            logging.info(f"BREAKOUT MONITORING: Monitoring for breakout on CE and PE")
+            # Only monitor the two highest OI strikes (one CE, one PE)
             symbols_to_monitor = []
             breakout_levels = {}
             if self.put_breakout_level and self.highest_put_oi_symbol:
                 symbols_to_monitor.append(self.highest_put_oi_symbol)
                 breakout_levels[self.get_canonical_symbol(self.highest_put_oi_symbol)] = self.put_breakout_level
             if self.call_breakout_level and self.highest_call_oi_symbol:
-                symbols_to_monitor.append(self.highest_call_oi_symbol)
+                # Avoid duplicate if both symbols are the same (shouldn't happen, but safe)
+                if self.highest_call_oi_symbol != self.highest_put_oi_symbol:
+                    symbols_to_monitor.append(self.highest_call_oi_symbol)
                 breakout_levels[self.get_canonical_symbol(self.highest_call_oi_symbol)] = self.call_breakout_level
+            # Remove duplicates just in case
+            symbols_to_monitor = list(dict.fromkeys(symbols_to_monitor))
+            # Enforce only one CE and one PE symbol
+            ce = next((s for s in symbols_to_monitor if "CE" in s), None)
+            pe = next((s for s in symbols_to_monitor if "PE" in s), None)
+            symbols_to_monitor = [s for s in (ce, pe) if s]
+            logging.info(f"[BREAKOUT][MONITOR] Final symbols to monitor: {symbols_to_monitor}")
             if not symbols_to_monitor:
                 logging.info("No valid option symbols to monitor for breakout.")
                 return
-            logging.info(f"Subscribing to both option symbols for breakout monitoring: {symbols_to_monitor}")
+            logging.info(f"[BREAKOUT][WS] Subscribing to only the two highest OI option symbols for breakout monitoring: {symbols_to_monitor}")
             if not self.retry_websocket_connection(symbols_to_monitor):
-                logging.error("Could not establish websocket connection after retries. Aborting breakout monitoring.")
+                logging.error("[BREAKOUT][WS][ERROR] Could not establish websocket connection after retries. Aborting breakout monitoring.")
                 return            
-            logging.info(f"WebSocket subscription started for symbols: {symbols_to_monitor}")
+            logging.info(f"[BREAKOUT][WS] WebSocket subscription started for symbols: {symbols_to_monitor}")
             canonical_symbols = [self.get_canonical_symbol(s) for s in symbols_to_monitor]
+            # Emit concise per-leg monitoring lines (match example output)
+            try:
+                for s in symbols_to_monitor:
+                    cb = breakout_levels.get(self.get_canonical_symbol(s))
+                    if 'CE' in s:
+                        logging.info(f"Monitoring CE {s} for breakout above {cb} (buffer: 0.1)")
+                    elif 'PE' in s:
+                        logging.info(f"Monitoring PE {s} for breakout above {cb} (buffer: 0.1)")
+            except Exception:
+                logging.debug("[BREAKOUT][MONITOR] Could not emit per-leg monitoring lines")
             
             while True:
+                # Forcibly exit if time is before market open or 9:20
+                ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                current_time = ist_now.time()
+                market_open_time = datetime.strptime("09:15", "%H:%M").time()
+                analysis_time = datetime.strptime("09:20", "%H:%M").time()
+                if current_time < market_open_time or current_time < analysis_time:
+                    logging.error(f"[MONITOR][FORCE-EXIT] Monitoring loop forcibly stopped: current time {current_time.strftime('%H:%M:%S')} is before allowed window.")
+                    break
                 for symbol, canonical_symbol in zip(symbols_to_monitor, canonical_symbols):
-                    # --- PATCH: Use DataFrame-based LTP for price decisions ---
                     df_row = self.ltp_df[self.ltp_df.symbol == canonical_symbol]
                     price = float(df_row.iloc[0]['ltp']) if not df_row.empty else None
                     breakout_level = breakout_levels[canonical_symbol]
@@ -548,21 +796,21 @@ class OpenInterestStrategy:
                         option_type = "CE"
                     elif "PE" in canonical_symbol:
                         option_type = "PE"
-                    logging.info(f"MONITOR: {canonical_symbol} ({option_type}) price={price} (Breakout: {breakout_level})")
+                    # ...existing code...
                     if price is not None:
                         if price >= breakout_level:
-                            logging.info(f"Breakout detected for {canonical_symbol} ({option_type}) at price {price} >= breakout level {breakout_level}. Executing trade entry.")
+                            # ...existing code...
                             trade_result = self.execute_trade(symbol=canonical_symbol, side='BUY', entry_price=price)
                             if trade_result:
-                                logging.info(f"Trade entry successful for {canonical_symbol} at price {price}.")
+                                logging.info(f"[TRADE][ENTRY] Trade entry successful for {canonical_symbol} at price {price}.")
                             else:
-                                logging.error(f"Trade entry failed for {canonical_symbol} at price {price}.")
+                                logging.error(f"[TRADE][ENTRY][ERROR] Trade entry failed for {canonical_symbol} at price {price}.")
                             self.unsubscribe_non_triggered_symbol(triggered_symbol=canonical_symbol, all_symbols=symbols_to_monitor)
                             return True
                 time.sleep(2)
             return False
         except Exception as e:
-            logging.error(f"Error monitoring for breakout: {str(e)}")
+            logging.error(f"[BREAKOUT][ERROR] Error monitoring for breakout: {str(e)}")
             return None
 
     def log_trade_update(self):
@@ -578,51 +826,63 @@ class OpenInterestStrategy:
         # Always use tick DataFrame LTP for the exact contract
         current_price = self.get_active_trade_ltp()
         if current_price is None:
-            logging.error(f"No tick DataFrame LTP available for active trade contract. Skipping trade update.")
+            logging.error(f"[TRADE][UPDATE][ERROR] No tick DataFrame LTP available for active trade contract. Skipping trade update.")
             return
-        logging.info(f"TRADE_UPDATE | Symbol: {symbol} | Entry: {entry_price} | LTP: {current_price} (source: tick DataFrame) | SL: {self.active_trade['stoploss']} | Target: {target}")
-        # Calculate P&L
         pnl = (current_price - entry_price) * quantity
         pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price else 0
-        # Track max up/down
         max_up = self.active_trade.get('max_up', None)
         max_up_pct = self.active_trade.get('max_up_pct', None)
         max_down = self.active_trade.get('max_down', None)
         max_down_pct = self.active_trade.get('max_down_pct', None)
         trailing_sl = stoploss
-        # Update max up only if unrealized profit increases
         if pnl > 0 and (max_up is None or pnl > max_up):
             self.active_trade['max_up'] = pnl
             self.active_trade['max_up_pct'] = pnl_pct
-        # Update max down only if unrealized loss increases (more negative)
         if pnl < 0 and (max_down is None or pnl < max_down):
             self.active_trade['max_down'] = pnl
             self.active_trade['max_down_pct'] = pnl_pct
-        # Trailing SL logic: only trail if profit exceeds 20%
-        profit_threshold = 20
-        if pnl_pct >= profit_threshold:
-            profit_above_20 = current_price - (entry_price * 1.2)
-            if profit_above_20 > 0:
-                new_sl = entry_price + 0.5 * (current_price - entry_price)
-                if new_sl > stoploss:
-                    self.active_trade['stoploss'] = round(new_sl, 2)
-                    trailing_sl = self.active_trade['stoploss']
-                    logging.info(f"Trailing SL updated to {trailing_sl} after exceeding {profit_threshold}% profit.")
-        # Ensure max_down and max_down_pct are floats for formatting
+        # Apply configurable trailing stop policy (separate helper)
+        try:
+            self._apply_trailing_stop(current_price, entry_price)
+        except Exception:
+            logging.debug("[TRADE][TRAILING] Failed to apply trailing stop policy")
         max_down_val = float(self.active_trade.get('max_down', 0) or 0)
         max_down_pct_val = float(self.active_trade.get('max_down_pct', 0) or 0)
         max_up_val = float(self.active_trade.get('max_up', 0) or 0)
         max_up_pct_val = float(self.active_trade.get('max_up_pct', 0) or 0)
-        logging.info(f"TRADE_UPDATE | Symbol: {symbol} | Entry: {entry_price} | LTP: {current_price} (source: tick DataFrame) | SL: {self.active_trade['stoploss']} | Target: {target} | P&L: {pnl:.2f} ({pnl_pct:.2f}%) | MaxUP: {max_up_val:.2f} ({max_up_pct_val:.2f}%) | MaxDN: {max_down_val:.2f} ({max_down_pct_val:.2f}%) | Trailing SL: {self.active_trade['stoploss']}")
-        logging.info(f"TRADE_MONITOR | Monitoring {symbol} for SL/Target/Exit conditions...")
+        # Rate-limit PAPER STATUS logs to avoid flooding; log at most once per configured interval
+        try:
+            now = time.time()
+            if (now - getattr(self, '_last_paper_status_time', 0)) >= getattr(self, '_paper_status_min_seconds', 5):
+                # Format numbers to two decimals and percentages with sign
+                ltp_str = f"{float(current_price):.2f}"
+                entry_str = f"{float(entry_price):.2f}"
+                sl_str = f"{float(self.active_trade.get('stoploss', 0)):.2f}"
+                tgt_str = f"{float(target):.2f}"
+                # Prepare PnL and MaxUp/MaxDn formatting
+                pnl_str = f"{pnl:.2f}"
+                max_up_val_f = float(max_up or 0.0)
+                max_down_val_f = float(max_down or 0.0)
+                max_up_pct_f = float(max_up_pct or 0.0)
+                max_down_pct_f = float(max_down_pct or 0.0)
+                max_up_str = f"{max_up_val_f:.2f} ({max_up_pct_f:.2f}%)"
+                max_down_str = f"{max_down_val_f:.2f} ({max_down_pct_f:.2f}%)"
+            try:
+                logging.info(
+                    f"[PAPER STATUS] {symbol} | LTP: {float(current_price):.2f} | Entry: {float(entry_price):.2f} | SL: {float(self.active_trade.get('stoploss', 0)):.2f} | Target: {float(target):.2f} | PnL: {pnl:.2f}"
+                )
+            except Exception:
+                logging.info(f"[PAPER STATUS] {symbol} | LTP: {current_price} | Entry: {entry_price} | PnL: {pnl:.2f}")
+        except Exception:
+            logging.exception("[PAPER STATUS][ERROR] Exception while preparing PAPER STATUS")
 
     def cleanup(self):
         """Cleanup resources before exiting"""
         try:
-            logging.info("Cleaning up strategy resources")
+            logging.info("[CLEANUP][START] Cleaning up strategy resources")
             # Force exit any open trade before shutdown
             if self.active_trade and not self.active_trade.get('exit_reason'):
-                logging.info("Forcing exit of open trade during cleanup to ensure exit is logged.")
+                logging.info("[CLEANUP][FORCE_EXIT] Forcing exit of open trade during cleanup to ensure exit is logged.")
                 self.process_exit(exit_reason="FORCED_CLEANUP")
             # Save any pending data
             self.save_trade_history()
@@ -630,9 +890,9 @@ class OpenInterestStrategy:
             if self.fyers:
                 # Close any active websocket connections, etc.
                 pass
-            logging.info("Cleanup completed")
+            logging.info("[CLEANUP][COMPLETE] Cleanup completed")
         except Exception as e:
-            logging.error(f"Error during cleanup: {str(e)}")
+            logging.error(f"[CLEANUP][ERROR] Error during cleanup: {str(e)}")
             return False
         return True
 
@@ -640,6 +900,139 @@ class OpenInterestStrategy:
         """Return current datetime in IST timezone"""
         return datetime.now(pytz.timezone('Asia/Kolkata'))
 
+    def get_active_trade_ltp(self):
+        """
+        Return the current LTP for the active trade's contract, preferring the live_prices map
+        then falling back to the internal ltp_df DataFrame. Returns a float or None.
+        """
+        try:
+            if not self.active_trade:
+                return None
+            symbol = self.active_trade.get('symbol')
+            if not symbol:
+                return None
+            # Prefer live_prices mapping
+            price = self.live_prices.get(symbol)
+            if price is not None:
+                try:
+                    return float(price)
+                except Exception:
+                    return None
+            # Fallback to ltp_df lookup
+            df_row = self.ltp_df[self.ltp_df.symbol == symbol]
+            if not df_row.empty:
+                try:
+                    return float(df_row.iloc[-1]['ltp'])
+                except Exception:
+                    return None
+            return None
+        except Exception:
+            logging.exception("[GET_ACTIVE_LTP] Exception while getting active trade LTP")
+            return None
+    def _apply_trailing_stop(self, current_price, entry_price):
+        """
+        Apply trailing stop policy based on configured percentage bands.
+        The rules are a list of (trigger_profit_pct, lock_sl_pct) pairs. We select the
+        highest trigger satisfied and lock SL to entry_price * (1 + lock_sl_pct/100).
+        SL is only moved up (never reduced).
+        """
+        try:
+            if not self.active_trade or not entry_price or current_price is None:
+                return
+            cfg = self.config.get('strategy', {}) if self.config else {}
+            use_trailing = bool(cfg.get('use_trailing_stop', True))
+            if not use_trailing:
+                return
+            # Default trailing rules matching user's requested scheme (percent values):
+            # trigger_pct -> lock SL to this pct above entry
+            rules = [
+                (13.0, 3.0),
+                (20.0, 10.0),
+                (25.0, 15.0),
+                (30.0, 25.0),
+                (35.0, 30.0),
+            ]
+            profit_pct = ((current_price - entry_price) / entry_price) * 100.0
+            # find highest rule satisfied
+            applicable = None
+            for trig, lock in rules:
+                if profit_pct >= trig:
+                    applicable = (trig, lock)
+            if not applicable:
+                return
+            lock_pct = applicable[1]
+            new_sl = round(entry_price * (1 + lock_pct / 100.0), 2)
+            cur_sl = float(self.active_trade.get('stoploss', 0) or 0)
+            if new_sl > cur_sl:
+                # Safety/config guards
+                trail_cfg = cfg.get('trailing', {}) if isinstance(cfg, dict) else {}
+                prefer_amend = bool(trail_cfg.get('prefer_amend', True))
+                min_move_pct = float(trail_cfg.get('min_move_pct', 0.5))
+                cooldown_secs = int(trail_cfg.get('cooldown_secs', 30))
+                max_mods = int(trail_cfg.get('max_modifications', 20))
+
+                nowt = time.time()
+                last_mod = float(self.active_trade.get('last_trailing_mod_time', 0) or 0)
+                mod_count = int(self.active_trade.get('trailing_mod_count', 0) or 0)
+                move_pct = ((new_sl - cur_sl) / entry_price) * 100.0 if entry_price else 0.0
+
+                if move_pct < min_move_pct:
+                    logging.debug(f"[TRAILING][SKIP] Proposed SL move {move_pct:.3f}% < min_move_pct {min_move_pct}%; skipping")
+                elif (nowt - last_mod) < cooldown_secs:
+                    logging.debug(f"[TRAILING][SKIP] Cooldown active: {(nowt-last_mod):.1f}s elapsed < {cooldown_secs}s; skipping")
+                elif mod_count >= max_mods:
+                    logging.warning(f"[TRAILING][SKIP] Reached max modifications ({mod_count}) for this trade; skipping further trailing")
+                else:
+                    bracket_id = self.active_trade.get('bracket_order_id') or self.active_trade.get('stop_loss_order_id')
+                    method_used = 'IN-MEMORY'
+                    success = False
+                    new_bracket_id = None
+                    try:
+                        if bracket_id:
+                            # Try amend first if preferred
+                            if prefer_amend:
+                                try:
+                                    resp = self.order_manager.modify_order_stoploss(bracket_id, new_sl)
+                                    if resp and resp.get('s') == 'ok':
+                                        method_used = 'AMEND'
+                                        success = True
+                                    else:
+                                        logging.debug(f"[TRAILING][AMEND] Amend response: {resp}")
+                                except Exception:
+                                    logging.exception("[TRAILING][AMEND] Exception during amend attempt")
+                            # Fallback to cancel+replace if amend not successful
+                            if not success:
+                                try:
+                                    resp2 = self.order_manager.cancel_and_replace_stop(bracket_id, new_sl)
+                                    # resp2 format mimics place_bracket_order
+                                    if resp2 and (resp2.get('order') or resp2.get('order_id') or resp2.get('status') == 'pending'):
+                                        method_used = 'CANCEL+REPLACE'
+                                        success = True
+                                        new_bracket_id = resp2.get('order', {}).get('order_id') or resp2.get('order_id')
+                                except Exception:
+                                    logging.exception("[TRAILING][REPLACE] Exception during cancel+replace attempt")
+                        else:
+                            # No associated bracket id — fall back to in-memory update
+                            logging.warning("[TRAILING][WARN] No bracket/stop order id available, updating in-memory only")
+                            success = True
+                            method_used = 'IN-MEMORY'
+                    except Exception:
+                        logging.exception("[TRAILING][ERROR] Error while attempting to modify stop order")
+
+                    if success:
+                        old_sl = cur_sl
+                        # If cancel+replace returned a new id, update active_trade
+                        if new_bracket_id:
+                            self.active_trade['bracket_order_id'] = new_bracket_id
+                        self.active_trade['stoploss'] = new_sl
+                        self.active_trade['trailing_locked_to_pct'] = lock_pct
+                        self.active_trade['last_trailing_mod_time'] = nowt
+                        self.active_trade['trailing_mod_count'] = mod_count + 1
+                        logging.info(f"[TRAILING][UPDATE] ({method_used}) Profit {profit_pct:.2f}% >= {applicable[0]}% -> moving SL from {old_sl} to {new_sl} (locked +{lock_pct}%)")
+                    else:
+                        logging.error("[TRAILING][ERROR] Failed to update stoploss via amend or cancel+replace; in-memory SL not changed")
+        except Exception:
+            logging.exception("[TRAILING][ERROR] Exception in _apply_trailing_stop")
     def get_canonical_symbol(self, symbol):
         """
         Convert any incoming symbol (raw or exchange-formatted) to the canonical format used for logging and processing.
@@ -649,25 +1042,101 @@ class OpenInterestStrategy:
         import re
         import logging
         orig_symbol = symbol
-        # If already in Fyers format, return as is
+        # Initialize rate-limiting state for symbol map logging
+        if not hasattr(self, '_symbol_map_last'):
+            # map of message -> last log time
+            self._symbol_map_last = {}
+            # map canonical target -> last original seen (to only log when mapping changes)
+            self._symbol_map_target_last = {}
+            # seconds to suppress repeated identical symbol map messages (increase cooldown to reduce noise)
+            self._symbol_map_cooldown = 60
+
+        # If already in Fyers format and strike is 5 digits, return as is
         if symbol.startswith('NSE:') and (symbol.endswith('CE') or symbol.endswith('PE')):
-            logging.info(f"[SYMBOL MAP] Already canonical: {symbol}")
-            return symbol
-        # Try to match NIFTY options: NIFTY07AUG25C24550 or NIFTY07AUG25P24550
-        match = re.match(r'NIFTY(\d{2})([A-Z]{3})(\d{2})([CP])(\d+)', symbol)
-        if match:
-            year, month, day, opt_type, strike = match.groups()
-            fyers_symbol = f"NSE:NIFTY{day}{month.upper()}{year}{strike}{'CE' if opt_type=='C' else 'PE'}"
-            logging.info(f"[SYMBOL MAP] {orig_symbol} -> {fyers_symbol}")
-            return fyers_symbol
-        # Fallback: use convert_option_symbol_format if available
+            match = re.match(r'NSE:[A-Z]+\d{6}(\d{4,5})(CE|PE)$', symbol)
+            if match:
+                # Rate-limit repeated identical SYMBOL MAP logs
+                now = time.time()
+                key = f"{orig_symbol} -> {symbol}"
+                last = self._symbol_map_last.get(key, 0)
+                if now - last >= self._symbol_map_cooldown:
+                    # If an active trade exists, suppress further SYMBOL MAP INFO logs to
+                    # avoid masking trade monitoring output; still update rate-limit state.
+                    suppress = False
+                    try:
+                        # Also suppress if there is a pending GTT for this symbol
+                        if hasattr(self, 'order_manager') and self.order_manager:
+                            pending = [o for o in self.order_manager.get_orders_by_symbol(symbol) if o.get('status_code') == 3]
+                            if pending:
+                                suppress = True
+                    except Exception:
+                        suppress = False
+                    if getattr(self, 'active_trade', None) or suppress:
+                        self._symbol_map_last[key] = now
+                    else:
+                        logging.info(f"[SYMBOL MAP] {orig_symbol} -> {symbol}")
+                        self._symbol_map_last[key] = now
+                return symbol
+            else:
+                return symbol
+        # Try to use the formatter utility for all other cases.
+        # Perform a lazy, cached import so that we avoid logging the same ImportError repeatedly.
+        if not hasattr(self, '_convert_option_symbol_format'):
+            try:
+                from src.symbol_formatter import convert_option_symbol_format as _conv
+                self._convert_option_symbol_format = _conv
+                self._symbol_formatter_import_failed = False
+            except Exception as e:
+                # Fallback to identity converter and warn once so logs are not flooded.
+                self._convert_option_symbol_format = lambda s: s
+                self._symbol_formatter_import_failed = True
+                logging.warning(f"[SYMBOL MAP] symbol_formatter import failed; falling back to identity converter. Error: {e}")
+
         try:
-            from src.symbol_formatter import convert_option_symbol_format
-            converted = convert_option_symbol_format(symbol)
-            logging.info(f"[SYMBOL MAP] {orig_symbol} -> {converted}")
-            return converted
+            converted = self._convert_option_symbol_format(symbol)
+            # Normalize and ensure canonical suffix/prefix (handle feeds that use 'C'/'P')
+            conv = converted.strip() if isinstance(converted, str) else str(converted)
+            if not conv.startswith('NSE:'):
+                conv = 'NSE:' + conv
+            # Normalize single-letter option type suffixes
+            if conv.endswith('C') and not conv.endswith('CE'):
+                conv = conv + 'E'
+            if conv.endswith('P') and not conv.endswith('PE'):
+                conv = conv + 'E'
+            # Rate-limit SYMBOL MAP logs: only log when the canonical mapping for this target
+            # changes (orig symbol differs) or when the cooldown has elapsed. This avoids
+            # flooding when many raw variants map to the same canonical symbol repeatedly.
+            now = time.time()
+            key = conv
+            last_orig = self._symbol_map_target_last.get(key)
+            last_time = self._symbol_map_last.get(key, 0)
+            # Only emit INFO when the mapping actually changed (orig -> conv differs). Otherwise, keep it DEBUG
+            if last_orig != orig_symbol:
+                # Suppress SYMBOL MAP INFO lines once a trade is active or while a pending
+                # GTT exists for this symbol so PAPER STATUS and bracket logs remain visible.
+                suppress = False
+                try:
+                    if hasattr(self, 'order_manager') and self.order_manager:
+                        pending = [o for o in self.order_manager.get_orders_by_symbol(conv) if o.get('status_code') == 3]
+                        if pending:
+                            suppress = True
+                except Exception:
+                    suppress = False
+                if getattr(self, 'active_trade', None) or suppress:
+                    # Update internal state but do not emit INFO-level symbol mapping logs
+                    self._symbol_map_target_last[key] = orig_symbol
+                    self._symbol_map_last[key] = now
+                else:
+                    logging.info(f"[SYMBOL MAP] {orig_symbol} -> {conv}")
+                    self._symbol_map_target_last[key] = orig_symbol
+                    self._symbol_map_last[key] = now
+            elif (now - last_time) >= self._symbol_map_cooldown:
+                logging.debug(f"[SYMBOL MAP - REFRESH] {orig_symbol} -> {conv} (refreshed after cooldown)")
+                self._symbol_map_last[key] = now
+            return conv
         except Exception as e:
             logging.error(f"[SYMBOL MAP] Error converting {orig_symbol}: {e}")
+            logging.error(traceback.format_exc())
             return symbol
 
     def stop_price_monitoring(self, symbol=None):
@@ -688,9 +1157,52 @@ class OpenInterestStrategy:
                     logging.info("Closed data socket after trade exit.")
                 except Exception as e:
                     logging.error(f"Error closing data socket: {e}")
-            self.data_socket = None
-        logging.info("Stopped all price monitoring after trade exit.")
-
+        self.data_socket = None
+    def _close_active_trade(self, exit_reason="manual", exit_price=None):
+        """
+        Close the currently active trade: cancel bracket order, record exit, save trade history and log PAPER EXIT.
+        """
+        try:
+            if not self.active_trade:
+                logging.warning("[EXIT] No active trade to close")
+                return False
+            symbol = self.active_trade.get('symbol')
+            qty = self.active_trade.get('quantity')
+            entry = self.active_trade.get('entry_price')
+            exit_p = exit_price if exit_price is not None else self.get_active_trade_ltp()
+            # Cancel bracket order if present
+            bracket_id = self.active_trade.get('bracket_order_id')
+            if bracket_id:
+                try:
+                    self.order_manager.cancel_order(bracket_id, reason=f"Exit by {exit_reason}")
+                except Exception:
+                    logging.exception("[EXIT] Failed to cancel bracket order")
+            # Mark trade history
+            pnl = (exit_p - entry) * qty if entry and exit_p else 0
+            self.trade_history.append({
+                'Entry DateTime': self.active_trade.get('entry_time'),
+                'Symbol': symbol,
+                'Direction': self.active_trade.get('side'),
+                'Entry Price': entry,
+                'Exit DateTime': datetime.now(pytz.timezone('Asia/Kolkata')),
+                'Exit Price': exit_p,
+                'P&L': pnl,
+                'Quantity': qty,
+                'Exit Reason': exit_reason
+            })
+            logging.info(f"[PAPER EXIT] {exit_reason} at {exit_p}")
+            # Log summary and persist
+            try:
+                self.save_trade_history()
+            except Exception:
+                logging.exception("[EXIT] Failed to save trade history")
+            # Clear active trade state
+            self.active_trade = {}
+            return True
+        except Exception as e:
+            logging.error(f"[EXIT][ERROR] Exception closing trade: {e}")
+            logging.error(traceback.format_exc())
+            return False
     def calculate_fyers_option_charges(self, entry_price, exit_price, quantity, state='maharashtra'):
         """
         Calculate total brokerage and all statutory charges for a round-trip options trade (buy+sell) on Fyers.
@@ -751,7 +1263,6 @@ class OpenInterestStrategy:
         if hasattr(self, '_tick_consumer_thread') and self._tick_consumer_thread and self._tick_consumer_thread.is_alive():
             logging.info("Tick consumer thread already running.")
             return
-        self._tick_consumer_thread_stop = False
         import threading
         def tick_consumer():
             logging.info("Tick queue consumer thread started.")
@@ -769,3 +1280,454 @@ class OpenInterestStrategy:
             logging.info("Tick consumer thread exiting.")
         self._tick_consumer_thread = threading.Thread(target=tick_consumer, name="TickQueueConsumer", daemon=True)
         self._tick_consumer_thread.start()
+
+    # --- OCO / GTT helpers and execution flow ---
+    def place_oco_gtt_orders(self, ce_symbol, ce_trigger, pe_symbol, pe_trigger, qty=25):
+        """
+        Place two GTT orders (one for CE, one for PE) in the same group so that when one triggers
+        the other is cancelled (mutual exclusivity / OCO semantics for paper-mode simulation).
+        """
+        try:
+            # Create a concise group id (timestamp only) to match requested log style
+            group_id = f"OCO-{int(time.time())}"
+            # Normalize symbols to canonical form for storage
+            ce_canon = self.get_canonical_symbol(ce_symbol)
+            pe_canon = self.get_canonical_symbol(pe_symbol)
+            logging.info(f"[OCO][PLACING] Group={group_id} CE={ce_canon}@{ce_trigger} | PE={pe_canon}@{pe_trigger} | QTY={qty}")
+            # Side: 1 for BUY trigger, -1 for SELL trigger (we are buying options)
+            r1 = self.order_manager.place_gtt_order(symbol=ce_canon, side=1, qty=qty, trigger_price=ce_trigger, tag='OCO', group_id=group_id)
+            r2 = self.order_manager.place_gtt_order(symbol=pe_canon, side=1, qty=qty, trigger_price=pe_trigger, tag='OCO', group_id=group_id)
+            logging.info(f"[OCO][SIM] Placed CE GTT: {r1.get('order_id')} | PE GTT: {r2.get('order_id')}")
+            # Start monitor thread for this group to detect triggers and convert to an active trade
+            t = threading.Thread(target=self._gtt_monitor_thread_fn, args=(group_id,), name=f"GTTMonitor-{group_id}", daemon=True)
+            t.start()
+            # Keep a reference so we can join/stop if needed
+            if not hasattr(self, '_gtt_monitor_threads'):
+                self._gtt_monitor_threads = {}
+            self._gtt_monitor_threads[group_id] = t
+            return True
+        except Exception as e:
+            logging.error(f"[OCO][ERROR] Failed to place OCO GTT orders: {e}")
+            logging.error(traceback.format_exc())
+            return False
+
+    def place_oco_bracket_orders(self, ce_symbol, ce_entry, pe_symbol, pe_entry, qty=25):
+        """
+        Place two simulated bracket orders (one CE, one PE) with entry limits equal to breakout levels.
+        Monitor them and when one fills, cancel the other (OCO semantics) and convert the filled
+        bracket into an active PAPER trade.
+        """
+        try:
+            group_id = f"OCO-{int(time.time())}"
+            ce_canon = self.get_canonical_symbol(ce_symbol)
+            pe_canon = self.get_canonical_symbol(pe_symbol)
+            # Suppress frequent websocket INFO ticks while placing and monitoring OCO orders
+            try:
+                self._suppress_ws_update_info = True
+            except Exception:
+                pass
+            logging.info("==============================================================================")
+            logging.info("PLACING OCO BRACKET ORDERS AT BREAKOUT LEVELS")
+            logging.info("==============================================================================")
+            logging.info(f"Placing CE BO: {ce_canon} @ {ce_entry:.2f} (trigger when price >= {ce_entry:.2f})")
+            # Place bracket orders via OrderManager (use configured SL/TG percentages when available)
+            cfg = self.config.get('strategy', {}) if self.config else {}
+            sl_pct = float(cfg.get('stoploss_pct', 20))
+            tgt_pct = float(cfg.get('target_pct', 40))
+            ce_sl = round(ce_entry * (1 - sl_pct / 100.0), 2)
+            ce_tg = round(ce_entry * (1 + tgt_pct / 100.0), 2)
+            r1 = self.order_manager.place_bracket_order(symbol=ce_canon, side=1, qty=qty, entry_price=ce_entry, stoploss=ce_sl, target=ce_tg, tag='OCO')
+            logging.info(f"[SIMULATION] Placed bracket order for {ce_canon} @ {ce_entry} qty={qty} (breakout={ce_entry})")
+            logging.info(f"Placing PE BO: {pe_canon} @ {pe_entry:.2f} (trigger when price >= {pe_entry:.2f})")
+            pe_sl = round(pe_entry * (1 - sl_pct / 100.0), 2)
+            pe_tg = round(pe_entry * (1 + tgt_pct / 100.0), 2)
+            r2 = self.order_manager.place_bracket_order(symbol=pe_canon, side=1, qty=qty, entry_price=pe_entry, stoploss=pe_sl, target=pe_tg, tag='OCO')
+            logging.info(f"[SIMULATION] Placed bracket order for {pe_canon} @ {pe_entry} qty={qty} (breakout={pe_entry})")
+            logging.info("==============================================================================")
+            logging.info("Both OCO bracket orders placed successfully!")
+            # Report order ids if available
+            try:
+                ce_id = r1.get('order_id') if isinstance(r1, dict) else None
+                pe_id = r2.get('order_id') if isinstance(r2, dict) else None
+                logging.info(f"CE Order ID: {ce_id}")
+                logging.info(f"PE Order ID: {pe_id}")
+            except Exception:
+                logging.debug("Could not read order ids from order manager response")
+            logging.info("Orders are now at broker with SL/TP configured.")
+            logging.info("Monitoring order status... whichever triggers first will cancel the other.")
+            # Track group -> order ids for cancellation when one fills
+            if not hasattr(self, 'bracket_groups'):
+                self.bracket_groups = {}
+            ids = []
+            if isinstance(r1, dict) and r1.get('order_id'):
+                ids.append(r1.get('order_id'))
+            if isinstance(r2, dict) and r2.get('order_id'):
+                ids.append(r2.get('order_id'))
+            self.bracket_groups[group_id] = ids
+            # Start monitor thread for bracket fills
+            t = threading.Thread(target=self._bracket_monitor_thread_fn, args=(group_id, ce_canon, pe_canon), name=f"BracketMonitor-{group_id}", daemon=True)
+            t.start()
+            if not hasattr(self, '_bracket_monitor_threads'):
+                self._bracket_monitor_threads = {}
+            self._bracket_monitor_threads[group_id] = t
+            return True
+        except Exception as e:
+            logging.error(f"[OCO][ERROR] Failed to place OCO bracket orders: {e}")
+            logging.error(traceback.format_exc())
+            return False
+
+    def _bracket_monitor_thread_fn(self, group_id, ce_symbol, pe_symbol, poll_interval=1.0):
+        """
+        Background thread to monitor simulated bracket orders. When one fills, cancel the other
+        and convert the filled bracket into an active PAPER trade.
+        """
+        logging.info(f"[OCO][MONITOR] Starting BRACKET monitor for group {group_id}")
+        try:
+            last_status_log = 0
+            status_log_interval = 7  # seconds between concise summary logs
+            while True:
+                # Ask OrderManager to check bracket orders based on current live prices
+                filled = self.order_manager.monitor_bracket_orders(get_price_func=lambda s: self.live_prices.get(s))
+                # Periodically emit a concise status summary (breakout levels, LTPs, order status)
+                try:
+                    now = time.time()
+                    if (now - last_status_log) >= status_log_interval:
+                        # Read LTPs for CE and PE
+                        ce_ltp = self.live_prices.get(ce_symbol) or 0.0
+                        pe_ltp = self.live_prices.get(pe_symbol) or 0.0
+                        ce_ltp_f = float(ce_ltp) if ce_ltp is not None else 0.0
+                        pe_ltp_f = float(pe_ltp) if pe_ltp is not None else 0.0
+                        # Breakout levels
+                        ce_break = float(self.call_breakout_level or 0.0)
+                        pe_break = float(self.put_breakout_level or 0.0)
+                        logging.info(f"[DEBUG] Breakout levels: CE={ce_break:.2f}, PE={pe_break:.2f} | LTPs: CE={ce_ltp_f:.2f}, PE={pe_ltp_f:.2f}")
+                        # Try to get order status strings from OrderManager
+                        try:
+                            ce_orders = self.order_manager.get_orders_by_symbol(ce_symbol) if hasattr(self.order_manager, 'get_orders_by_symbol') else []
+                            pe_orders = self.order_manager.get_orders_by_symbol(pe_symbol) if hasattr(self.order_manager, 'get_orders_by_symbol') else []
+                            ce_status = 'PENDING'
+                            pe_status = 'PENDING'
+                            if ce_orders and isinstance(ce_orders, list) and len(ce_orders) > 0:
+                                s = ce_orders[0].get('status') or ce_orders[0].get('status_text') or ce_orders[0].get('status_code')
+                                ce_status = str(s)
+                            if pe_orders and isinstance(pe_orders, list) and len(pe_orders) > 0:
+                                s = pe_orders[0].get('status') or pe_orders[0].get('status_text') or pe_orders[0].get('status_code')
+                                pe_status = str(s)
+                            logging.info(f"Order Status: CE={ce_status} | PE={pe_status}")
+                            logging.info(f"Current Prices: CE LTP: {ce_ltp_f:.2f} | PE LTP: {pe_ltp_f:.2f}")
+                        except Exception:
+                            logging.debug("[OCO][MONITOR] Could not fetch order statuses for concise log")
+                        last_status_log = now
+                except Exception:
+                    logging.debug("[OCO][MONITOR] Status summary failed (non-fatal)")
+
+                if filled:
+                    for order in filled:
+                        oid = order.get('order_id')
+                        symbol = order.get('symbol')
+                        price = order.get('filled_price') or order.get('entry_price') or order.get('price')
+                        qty = order.get('qty')
+                        # Only process orders that belong to our group
+                        group_ids = self.bracket_groups.get(group_id, [])
+                        if oid not in group_ids:
+                            continue
+                        # Cancel sibling(s)
+                        for other_oid in group_ids:
+                            if other_oid != oid:
+                                try:
+                                    self.order_manager.cancel_order(other_oid, reason='OCO - sibling filled')
+                                except Exception:
+                                    logging.exception(f"[OCO][MONITOR] Failed to cancel sibling order {other_oid}")
+                        # Emit compact simulation-style messages matching sample
+                        leg = 'CE' if 'CE' in symbol else 'PE'
+                        other_leg = 'PE' if leg == 'CE' else 'CE'
+                        try:
+                            logging.info(f"[SIMULATION] {leg} breakout triggered! {leg} order FILLED at {price}. {other_leg} order CANCELLED (OCO logic).")
+                            # Update shown order status line
+                            if leg == 'CE':
+                                logging.info("Order Status: CE=FILLED | PE=CANCELLED")
+                            else:
+                                logging.info("Order Status: CE=CANCELLED | PE=FILLED")
+                            logging.info("==============================================================================")
+                            logging.info(f"{leg} ORDER TRIGGERED/FILLED! Cancelling {other_leg} order...")
+                            logging.info("==============================================================================")
+                            logging.info(f"{leg} position active with automatic SL and Target management by broker")
+                        except Exception:
+                            logging.debug("[OCO][MONITOR] Filled order logged")
+                        # Stop suppressing websocket INFO ticks now that a trade was entered
+                        try:
+                            self._suppress_ws_update_info = False
+                        except Exception:
+                            pass
+                        # Convert filled bracket into an active trade
+                        try:
+                            self.execute_trade(symbol=symbol, side='BUY', entry_price=price, quantity=qty)
+                        except Exception:
+                            logging.exception("[OCO][MONITOR] Failed to execute trade from filled bracket order")
+                        # Done with this group
+                        return
+                time.sleep(poll_interval)
+        except Exception as e:
+            logging.error(f"[OCO][MONITOR][ERROR] Error in BRACKET monitor for group {group_id}: {e}")
+            logging.error(traceback.format_exc())
+
+    def _gtt_monitor_thread_fn(self, group_id, poll_interval=1.5):
+        """
+        Background thread which polls OrderManager.monitor_active_gtt_orders to detect when a GTT
+        in the group triggers. When trigger detected, convert trigger into an active_trade, cancel others
+        (OrderManager already cancels the group members), and start trade monitoring.
+        """
+        logging.info(f"[OCO][MONITOR] Starting GTT monitor for group {group_id}")
+        try:
+            # Keep track of triggers we've already processed to avoid duplicates
+            processed_triggers = set()
+            while True:
+                # Poll and check for triggered orders
+                triggered = self.order_manager.monitor_active_gtt_orders(get_price_func=lambda s: self.live_prices.get(s))
+                # monitor_active_gtt_orders returns list of triggered order dicts
+                for order in triggered:
+                    if order.get('group_id') != group_id:
+                        continue
+                    # We have a triggered GTT -> treat as filled entry for paper trading
+                    symbol = order.get('symbol')
+                    # Prefer order-reported price, otherwise try live websocket price
+                    price = order.get('price') or order.get('trigger_price')
+                    if price is None:
+                        # Try to read from live prices map first; wait briefly to allow websocket to populate
+                        price = self.live_prices.get(symbol)
+                        if price is None:
+                            # Give websocket a short window to deliver ticks
+                            logging.debug(f"[OCO][MONITOR] No live price for {symbol} yet; waiting up to 2s for websocket ticks before REST fallback")
+                            waited = 0.0
+                            while waited < 2.0 and price is None:
+                                time.sleep(0.25)
+                                waited += 0.25
+                                price = self.live_prices.get(symbol)
+                    if price is None:
+                        # As a last resort, attempt REST quotes fallback via fyers API
+                        try:
+                            from src.fyers_api_utils import get_ltp as fyers_get_ltp
+                            logging.info(f"[OCO][MONITOR] Falling back to REST LTP for {symbol}")
+                            rest_price = fyers_get_ltp(self.fyers, symbol, websocket_client=getattr(self, 'data_socket', None))
+                            if rest_price:
+                                price = rest_price
+                                logging.info(f"[OCO][MONITOR] REST LTP for {symbol}: {price}")
+                            else:
+                                logging.warning(f"[OCO][MONITOR] REST LTP unavailable for {symbol}; proceeding with trigger price if present")
+                        except Exception:
+                            logging.exception(f"[OCO][MONITOR] Exception while fetching REST LTP for {symbol}")
+                    qty = order.get('qty')
+                    logging.info(f"[OCO][TRIGGERED] Group={group_id} Order={order.get('order_id')} Symbol={symbol} Price={price} Qty={qty}")
+                    # Cancel other orders (OrderManager.monitor_active_gtt_orders already called cancel_group_gtt_orders)
+                    # Convert trigger into an active trade record
+                    self.execute_trade(symbol=symbol, side='BUY', entry_price=price, quantity=qty)
+                    # Stop monitoring this group after first trigger
+                    logging.info(f"[OCO][MONITOR] Stopping monitor for group {group_id} after trigger.")
+                    return
+                # Additionally, check for any orders that may have been triggered by other parts of
+                # the system (or by order_manager from another thread). This ensures we don't miss
+                # externally-updated triggers that occurred between polls.
+                try:
+                    # Use get_orders_by_status helper to find already-triggered orders
+                    triggered_orders = self.order_manager.get_orders_by_status(2)  # 2 == TRIGGERED
+                    for order in triggered_orders:
+                        oid = order.get('order_id')
+                        if oid in processed_triggers:
+                            continue
+                        if order.get('group_id') != group_id:
+                            continue
+                        # Process this triggered order
+                        symbol = order.get('symbol')
+                        qty = order.get('qty')
+                        price = order.get('price') or order.get('trigger_price') or self.live_prices.get(symbol)
+                        logging.info(f"[OCO][MONITOR][DETECT] Found externally-triggered GTT in group {group_id}: {oid} {symbol} price={price}")
+                        # Ensure we have a price (try REST fallback)
+                        if price is None:
+                            try:
+                                from src.fyers_api_utils import get_ltp as fyers_get_ltp
+                                rest_price = fyers_get_ltp(self.fyers, symbol, websocket_client=getattr(self, 'data_socket', None))
+                                if rest_price:
+                                    price = rest_price
+                                    logging.info(f"[OCO][MONITOR] REST price for {symbol}: {price}")
+                            except Exception:
+                                logging.exception(f"[OCO][MONITOR] Exception while fetching REST LTP for {symbol}")
+                        # Execute trade using detected trigger
+                        processed_triggers.add(oid)
+                        self.execute_trade(symbol=symbol, side='BUY', entry_price=price, quantity=qty)
+                        logging.info(f"[OCO][MONITOR] Processed externally-triggered GTT {oid} for group {group_id}")
+                        return
+                except Exception:
+                    logging.exception(f"[OCO][MONITOR] Error checking externally-triggered orders for group {group_id}")
+                time.sleep(poll_interval)
+        except Exception as e:
+            logging.error(f"[OCO][MONITOR][ERROR] Error in GTT monitor thread for group {group_id}: {e}")
+            logging.error(traceback.format_exc())
+
+    def _on_order_manager_gtt_callback(self, order):
+        """
+        Callback invoked (in a separate thread) when OrderManager notifies of a triggered GTT.
+        This ensures we immediately convert the trigger into an active trade without waiting
+        for the next poll cycle.
+        """
+        try:
+            group_id = order.get('group_id')
+            symbol = order.get('symbol')
+            qty = order.get('qty')
+            price = order.get('price') or order.get('trigger_price') or self.live_prices.get(symbol)
+            logging.info(f"[OCO][CALLBACK] Received GTT trigger callback: group={group_id} order={order.get('order_id')} symbol={symbol} price={price}")
+            # Try REST fallback if price missing
+            if price is None:
+                try:
+                    from src.fyers_api_utils import get_ltp as fyers_get_ltp
+                    rest_price = fyers_get_ltp(self.fyers, symbol, websocket_client=getattr(self, 'data_socket', None))
+                    if rest_price:
+                        price = rest_price
+                        logging.info(f"[OCO][CALLBACK] REST price for {symbol}: {price}")
+                except Exception:
+                    logging.exception(f"[OCO][CALLBACK] Exception fetching REST LTP for {symbol}")
+            # Execute trade if we have a price (or even if price None, execute_trade will validate)
+            self.execute_trade(symbol=symbol, side='BUY', entry_price=price, quantity=qty)
+        except Exception:
+            logging.exception("[OCO][CALLBACK] Exception while handling GTT callback")
+
+    def execute_trade(self, symbol, side='BUY', entry_price=None, quantity=None):
+        """
+        Convert an entry (market/GTT trigger) into the internal active_trade representation and
+        start the periodic PAPER STATUS monitoring. Returns True on success.
+        """
+        try:
+            if not symbol:
+                logging.error("[EXECUTE][ERROR] No symbol provided for execute_trade")
+                return False
+            # Accept either canonical or raw; normalize for internal storage
+            canonical = self.get_canonical_symbol(symbol)
+            if quantity is None:
+                try:
+                    quantity = int(self.config.get('strategy', {}).get('quantity', 25))
+                except Exception:
+                    quantity = 25
+            if entry_price is None:
+                # Try to read from live prices / ltp_df
+                entry_price = float(self.live_prices.get(canonical) or 0)
+            if not entry_price or entry_price <= 0:
+                logging.error(f"[EXECUTE][ERROR] Invalid entry price for {canonical}: {entry_price}")
+                return False
+            # Build active trade structure
+            self.active_trade = {
+                'symbol': canonical,
+                'entry_price': float(entry_price),
+                'entry_time': datetime.now(pytz.timezone('Asia/Kolkata')), 
+                'quantity': int(quantity),
+                'side': side,
+                'stoploss': round(entry_price * 0.7, 2),  # placeholder: initial stoploss at 30% of entry
+                'target': round(entry_price * 1.5, 2),    # placeholder: target at +50%
+            }
+            logging.info(f"[TRADE][ENTER] Entered PAPER trade: {self.active_trade['symbol']} | Entry: {self.active_trade['entry_price']} | Qty: {self.active_trade['quantity']}")
+            # After entering a trade, prefer trade-monitoring logs over symbol-mapping and
+            # websocket heartbeat logs. Signal the websocket/data socket (if present)
+            # to reduce heartbeat INFO spam, and avoid emitting SYMBOL MAP INFO lines.
+            try:
+                if hasattr(self, 'data_socket') and getattr(self, 'data_socket') is not None:
+                    md = getattr(self.data_socket, 'market_data', None)
+                    if isinstance(md, dict) or hasattr(md, 'market_status'):
+                        try:
+                            # set a flag so websocket implementation can suppress heartbeat INFO
+                            md.market_status['suppress_heartbeat'] = True
+                        except Exception:
+                            # If market_data is a plain dict, ensure key exists
+                            try:
+                                md['market_status']['suppress_heartbeat'] = True
+                            except Exception:
+                                pass
+            except Exception:
+                logging.debug("[EXECUTE] Could not set websocket suppress_heartbeat flag")
+            # Place a simulated bracket order (entry + SL + Target) in OrderManager for paper mode
+            try:
+                cfg = self.config.get('strategy', {}) if self.config else {}
+                sl_pct = float(cfg.get('stoploss_pct', 20))
+                tgt_pct = float(cfg.get('target_pct', 40))
+                stoploss = round(self.active_trade['entry_price'] * (1 - sl_pct / 100.0), 2)
+                target = round(self.active_trade['entry_price'] * (1 + tgt_pct / 100.0), 2)
+                bracket = self.order_manager.place_bracket_order(symbol=canonical, side=1, qty=self.active_trade['quantity'], entry_price=self.active_trade['entry_price'], stoploss=stoploss, target=target, tag='BRACKET')
+                # Debug/log the raw response from OrderManager to diagnose missing bracket placements
+                # Log raw bracket response at INFO so it's visible in normal runs/simulations
+                logging.info(f"[EXECUTE][DEBUG] Raw bracket response: {bracket}")
+                # Handle both forms: {'order_id': id, ...} or {'order_id': id, 'order': {...}}
+                try:
+                    bracket_order_id = None
+                    if isinstance(bracket, dict):
+                        bracket_order_id = bracket.get('order_id') or (bracket.get('order') or {}).get('order_id')
+                    if bracket_order_id:
+                        self.active_trade['bracket_order_id'] = bracket_order_id
+                        logging.info(f"[ORDER][BRACKET] Placed bracket order id: {bracket_order_id} SL:{stoploss} TG:{target}")
+                        logging.info(f"[ORDER][BRACKET][DETAILS] {bracket}")
+                        # Ensure the active trade's SL/Target reflect the bracket order placed
+                        try:
+                            self.active_trade['stoploss'] = float(stoploss)
+                            self.active_trade['target'] = float(target)
+                        except Exception:
+                            logging.debug("[EXECUTE] Could not sync active_trade SL/TG from bracket values")
+                        # Record trailing stop percentage from config for later updates
+                        try:
+                            trailing_pct = float(cfg.get('trailing_stop_pct', 8)) if cfg else 8.0
+                            self.active_trade['trailing_stop_pct'] = trailing_pct
+                        except Exception:
+                            self.active_trade['trailing_stop_pct'] = 8.0
+                        # Start exit monitor to watch for SL / Target hits
+                        try:
+                            self.start_exit_monitor()
+                        except Exception:
+                            logging.exception("[EXECUTE] Failed to start exit monitor thread")
+                        # Also log current live LTP for the contract so simulation fill checks can be correlated
+                        try:
+                            cur_ltp = self.live_prices.get(self.active_trade['symbol'])
+                            logging.info(f"[EXECUTE][INFO] Current live LTP for {self.active_trade['symbol']}: {cur_ltp}")
+                        except Exception:
+                            logging.debug("[EXECUTE][INFO] Could not read live_prices for bracket symbol")
+                    else:
+                        logging.error(f"[ORDER][BRACKET][ERROR] Bracket placement failed for {canonical}. Response: {bracket}")
+                except Exception:
+                    logging.exception("[ORDER][BRACKET][ERROR] Exception while processing bracket placement response")
+            except Exception:
+                logging.exception("[ORDER][BRACKET] Failed to place simulated bracket order")
+            # Start periodic PAPER STATUS monitor thread
+            if not hasattr(self, '_paper_status_thread') or not getattr(self, '_paper_status_thread'):
+                def paper_status_runner():
+                    logging.info("[PAPER STATUS THREAD] Started")
+                    while self.active_trade and not self.market_closed:
+                        try:
+                            self.log_trade_update()
+                        except Exception:
+                            logging.exception("[PAPER STATUS THREAD] Exception in log_trade_update")
+                        time.sleep(max(1, getattr(self, '_paper_status_min_seconds', 5)))
+                    logging.info("[PAPER STATUS THREAD] Exiting")
+                # Guard thread creation against interpreter shutdown (prevents RuntimeError seen when process is exiting)
+                try:
+                    import sys as _sys
+                    if hasattr(_sys, 'is_finalizing') and _sys.is_finalizing():
+                        logging.error("[EXECUTE][WARN] Interpreter is finalizing; skipping background PAPER STATUS thread")
+                    else:
+                        self._paper_status_thread = threading.Thread(target=paper_status_runner, name="PaperStatusThread", daemon=True)
+                        try:
+                            self._paper_status_thread.start()
+                        except RuntimeError as e:
+                            # This can happen during interpreter shutdown; fall back to immediate status log
+                            logging.error(f"[EXECUTE][ERROR] Could not start PAPER STATUS thread: {e}")
+                            try:
+                                self.log_trade_update()
+                            except Exception:
+                                logging.exception("[EXECUTE] Failed to emit immediate PAPER STATUS after thread start failure")
+                            self._paper_status_thread = None
+                except Exception:
+                    # Any unexpected error here should not stop execution of the strategy
+                    logging.exception("[EXECUTE] Unexpected error when creating PAPER STATUS thread")
+            # Emit an immediate PAPER STATUS snapshot so operator sees trade monitoring right after entry
+            try:
+                self.log_trade_update()
+            except Exception:
+                logging.exception("[EXECUTE] Failed to emit immediate PAPER STATUS after trade entry")
+            return True
+        except Exception as e:
+            logging.error(f"[EXECUTE][ERROR] Failed to execute trade for {symbol}: {e}")
+            logging.error(traceback.format_exc())
+            return False

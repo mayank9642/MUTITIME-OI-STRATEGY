@@ -1,9 +1,9 @@
 fyers:
-  access_token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiZDoxIiwiZDoyIiwieDowIiwieDoxIiwieDoyIl0sImF0X2hhc2giOiJnQUFBQUFCby1aVW1yQmUweTRjaEE0aHRHaHpia3ctNExRY3VvWVB5TkZJT1B1NjFJWW5EM1ktaTdMNUpwUy1ndnJGTnN6OVY1dFFiZklncDdjME0xaEg3TVg2M1cwemRkREFtTzhpMm5hd2R2Vi1CczRJRU16cz0iLCJkaXNwbGF5X25hbWUiOiIiLCJvbXMiOiJLMSIsImhzbV9rZXkiOiIyZTUwMTJhYmIzYTRhYWRkYjM3MDllNzNjYTQyNzgyNDY4ZjMwZmVlMGRlZTFhZjRmNDhkNTQyMSIsImlzRGRwaUVuYWJsZWQiOiJOIiwiaXNNdGZFbmFibGVkIjoiTiIsImZ5X2lkIjoiWU0wNDA3NyIsImFwcFR5cGUiOjEwMCwiZXhwIjoxNzYxMjY1ODAwLCJpYXQiOjE3NjExODcxMTAsImlzcyI6ImFwaS5meWVycy5pbiIsIm5iZiI6MTc2MTE4NzExMCwic3ViIjoiYWNjZXNzX3Rva2VuIn0.QN1sHx5scrCEh8YtzBC1eKkKpOPXDdX5MA8vHC_1O8Q
+  access_token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiZDoxIiwiZDoyIiwieDowIiwieDoxIiwieDoyIl0sImF0X2hhc2giOiJnQUFBQUFCcHVoNWhUQUNKaFh4VGZObENpRzlhMENjNnctSENhMHR0SVJsU3daVXFBX0VrR3dpby1wVEhpZTRVcEwwcDZ2MmxRVHM2a19NeGZwOHJzTHZOT21YVkZXMXUxcU40TzdxU2VrLUZHVmhpZFJxR2Y5ST0iLCJkaXNwbGF5X25hbWUiOiIiLCJvbXMiOiJLMSIsImhzbV9rZXkiOiI0MjJlNGNhN2YyYjFjNTI3ZjlhYTViNzg2OGFmNzdlNmE3NWYyN2QyYjJmNGI1NzdkNjVkZjM0ZCIsImlzRGRwaUVuYWJsZWQiOiJOIiwiaXNNdGZFbmFibGVkIjoiTiIsImZ5X2lkIjoiWU0wNDA3NyIsImFwcFR5cGUiOjEwMCwiZXhwIjoxNzczODgwMjAwLCJpYXQiOjE3NzM4MDUxNTMsImlzcyI6ImFwaS5meWVycy5pbiIsIm5iZiI6MTc3MzgwNTE1Mywic3ViIjoiYWNjZXNzX3Rva2VuIn0.kmXgGgo5szPDttufrnA-5gEILKSyHtzRgipFn3-ADbw
   client_id: QZAWYQ69KZ-100
   redirect_uri: https://trade.fyers.in/api-login/redirect-uri/index.html
   secret_key: J02WG5J3V9
-  token_expiry: '2025-10-24 08:08:31'
+  token_expiry: '2026-03-19 09:09:13'
   totp_key: ''
 logging:
   file: logs/strategy.log
@@ -27,3 +27,11 @@ strategy:
   trailing_stop_pct: 8
   trailing_trigger_pct: 12
   use_trailing_stop: true
+  trailing:
+    prefer_amend: true
+    min_move_pct: 0.5
+    cooldown_secs: 30
+    max_modifications: 20
+  trailing_modify:
+    retry_count: 2
+    retry_delay_secs: 0.5

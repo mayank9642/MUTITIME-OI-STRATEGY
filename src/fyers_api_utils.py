@@ -12,26 +12,8 @@ import re
 from src.config import load_config
 from src.token_helper import ensure_valid_token
 
-# Monkey patch the logging system to filter sensitive information
-orig_info = logging.Logger.info
-@functools.wraps(orig_info)
-def filtered_info(self, msg, *args, **kwargs):
-    # Filter out any debug messages containing token information
-    if isinstance(msg, str) and "[DEBUG] get_fyers_client" in msg and ("token" in msg or "access_token" in msg):
-        # Replace token information with placeholder
-        safe_msg = msg
-        if "client_id=" in safe_msg:
-            safe_msg = re.sub(r'client_id=[^,\s]+', 'client_id=***FILTERED***', safe_msg)
-        if "token" in safe_msg:
-            safe_msg = re.sub(r'access_token_head=[^,\s]+', 'access_token=***FILTERED***', safe_msg)
-            safe_msg = re.sub(r'token_combo=[^,\s]+', 'token_combo=***FILTERED***', safe_msg)
-        # Call original with filtered message
-        return orig_info(self, safe_msg, *args, **kwargs)
-    # Pass through other messages
-    return orig_info(self, msg, *args, **kwargs)
 
-# Apply the monkey patch
-logging.Logger.info = filtered_info
+# (Monkey patch removed to avoid recursion and file locking issues)
 
 def get_fyers_client(check_token=True):
     """
@@ -393,9 +375,18 @@ def robust_market_data_websocket(symbols, callback_handler=None, data_type="Symb
                     market_data_df.tick_count = 0
                 market_data_df.tick_count += 1
                 
-                # Log an active heartbeat every 50 ticks
+                # Log an active heartbeat every 50 ticks. Allow suppression when a trade is active
+                # to avoid masking trade-monitor logs (strategy sets market_status['suppress_heartbeat']=True).
                 if market_data_df.tick_count % 50 == 0:
-                    logging.info(f"WebSocket active: {market_data_df.tick_count} ticks received")
+                    suppress = False
+                    try:
+                        suppress = bool(market_data_df.market_status.get('suppress_heartbeat', False))
+                    except Exception:
+                        suppress = False
+                    if suppress:
+                        logging.debug(f"WebSocket active: {market_data_df.tick_count} ticks received (suppressed)")
+                    else:
+                        logging.info(f"WebSocket active: {market_data_df.tick_count} ticks received")
             
             # Check for market closed condition (receiving data but no LTP)
             elif now - market_data_df.market_status['last_check'] > 30:  # Check every 30 seconds

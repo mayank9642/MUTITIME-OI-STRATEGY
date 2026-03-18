@@ -64,20 +64,14 @@ def improved_market_data_websocket(symbols, callback_handler=None, data_type="Sy
         'last_message_time': 0,
         'connection_time': 0,
         'tick_count': 0,
-        # last_status_count stores the tick_count value when we last emitted the 'WebSocket active' info
-        'last_status_count': 0,
-        # timestamp when we last logged a 'WebSocket active' message
-        'last_status_time': 0
+        'status_logged': False
     }
     
     # Handle incoming messages
     def on_message(ws_ticks):
         now = time.time()
         connection_status['last_message_time'] = now
-
-        # DIAGNOSTIC: Log every raw tick received (now back to DEBUG level)
-        logging.debug(f"WS RAW TICK: {ws_ticks}")
-
+        
         if debug:
             logging.debug(f"Received tick data: {ws_ticks}")
         
@@ -100,32 +94,21 @@ def improved_market_data_websocket(symbols, callback_handler=None, data_type="Sy
         
         # Put in queue for later processing
         tick_queue.put(ws_ticks)
-        
-        # Call the handler
+          # Call the handler
         if callback_handler:
             try:
-                # Keep the callback invocation, but avoid dumping the entire ws_ticks at INFO level.
-                # Log a compact summary at DEBUG level to avoid flooding logs with full tick dicts.
-                ltp = ws_ticks.get('ltp') if isinstance(ws_ticks, dict) else None
-                logging.debug(f"WS CALLBACK: symbol={symbol} ltp={ltp}")
                 callback_handler(symbol, 'tick', ws_ticks, ws_ticks)
             except Exception as e:
                 logging.error(f"Error in callback handler: {e}")
-                # Add more detailed error logging
                 logging.debug(f"Callback error details: {traceback.format_exc()}")
         
-        # Log diagnostic information (rate-limit to avoid frequent duplicates).
-        # Emit when we've advanced by a large number of ticks (e.g., 500) OR at most once every
-        # 30 seconds when we've received at least 50 new ticks since the last status log.
-        now_ts = time.time()
-        last_count = connection_status.get('last_status_count', 0)
-        last_time = connection_status.get('last_status_time', 0)
-        delta = connection_status['tick_count'] - last_count
-        # Condition: log if (a) delta >= 500 OR (b) at least 30s elapsed and delta >= 50
-        if delta >= 500 or ((now_ts - last_time) >= 30 and delta >= 50):
+        # Log diagnostic information
+        if connection_status['tick_count'] % 50 == 0 and not connection_status['status_logged']:
             logging.info(f"WebSocket active: received {connection_status['tick_count']} ticks")
-            connection_status['last_status_count'] = connection_status['tick_count']
-            connection_status['last_status_time'] = now_ts
+            connection_status['status_logged'] = True
+        
+        if connection_status['tick_count'] % 100 == 0:
+            connection_status['status_logged'] = False
     
     # Handle connection errors
     def on_error(error):
@@ -201,26 +184,6 @@ def improved_market_data_websocket(symbols, callback_handler=None, data_type="Sy
             
             # Attach the close method
             client.close_connection = close_connection
-            
-            # Add unsubscribe method to the client
-            def unsubscribe(symbol):
-                try:
-                    # Fyers expects a list of symbols for unsubscribe
-                    if hasattr(client, 'unsubscribe'):
-                        client.unsubscribe(symbols=[symbol], data_type=data_type)
-                        logging.info(f"Unsubscribed from symbol: {symbol}")
-                    else:
-                        # Manual unsubscribe message (fallback)
-                        import json
-                        message = json.dumps({"T": "SUB_MDATA", "S": [symbol], "SUB_T": -1})
-                        if hasattr(client, 'send'):
-                            client.send(message)
-                            logging.info(f"Manual unsubscribe message sent for symbol: {symbol}")
-                        else:
-                            logging.warning(f"No unsubscribe method or send method available on client for symbol: {symbol}")
-                except Exception as e:
-                    logging.error(f"Error unsubscribing from symbol {symbol}: {e}")
-            client.unsubscribe = unsubscribe
             
             # Start heartbeat thread to monitor connection
             def heartbeat_monitor():

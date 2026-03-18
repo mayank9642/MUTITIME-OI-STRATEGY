@@ -1,2 +1,9 @@
-# This file makes the src directory a Python package
-# allowing imports like 'from src.config import load_config'
+"""src package initializer.
+
+This file intentionally left minimal to make ``src`` an importable package
+so modules like ``src.symbol_formatter`` can be imported reliably.
+"""
+
+__all__ = [
+    # Keep this list small; modules are imported explicitly where needed.
+]
