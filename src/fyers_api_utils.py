@@ -63,21 +63,70 @@ def place_market_order(fyers, symbol, qty, side):
         Order response from Fyers API
     """
     try:
-        order_data = {
-            "symbol": symbol,
-            "qty": qty,
-            "type": 2,  # 2 = Market order
-            "side": 1 if side == "BUY" else -1,  # 1 = Buy, -1 = Sell
-            "productType": "INTRADAY",
-            "validity": "DAY",
-            "offlineOrder": False,
-            "stopPrice": 0,
-            "limitPrice": 0
-        }
-        
-        response = fyers.place_order(data=order_data)
-        logging.info(f"Order placed: {symbol} {side} {qty} - Response: {response}")
-        return response
+        # Regulatory change: market orders are not permitted. Use a tight limit at current LTP
+        from src.fyers_api_utils import get_ltp as _get_ltp
+        try:
+            ltp = _get_ltp(fyers, symbol)
+        except Exception:
+            ltp = None
+
+        if ltp and float(ltp) > 0:
+            # Place a tight limit around the LTP to emulate a market-with-protection
+            # Use a small buffer: for buy use LTP + 0.01, for sell use LTP - 0.01
+            try:
+                limit_price = round(float(ltp) + (0.01 if side == 'BUY' else -0.01), 2)
+            except Exception:
+                limit_price = float(ltp)
+            logging.info(f"[SAFE-MARKET] Placing limit order at LTP {ltp} (limit {limit_price}) for {symbol} qty={qty} side={side}")
+            # Compute protection price (small configurable pct)
+            try:
+                cfg = load_config()
+                protect_pct = float(cfg.get('strategy', {}).get('protection_price_pct', 0.2))
+            except Exception:
+                protect_pct = 0.2
+            try:
+                if side == 'BUY':
+                    protection_price = round(float(ltp) * (1 + protect_pct/100.0), 2)
+                else:
+                    protection_price = round(float(ltp) * (1 - protect_pct/100.0), 2)
+            except Exception:
+                protection_price = limit_price
+
+            return place_limit_order(fyers, symbol, qty, side, limit_price, protection_price=protection_price)
+        else:
+            logging.warning("Could not obtain LTP for safe-limit market emulation; falling back to market order (platform may convert to MPP or reject).")
+            # Add protectionPrice for MPP-compliant market orders
+            try:
+                cfg = load_config()
+                protect_pct = float(cfg.get('strategy', {}).get('protection_price_pct', 0.2))
+            except Exception:
+                protect_pct = 0.2
+            try:
+                if ltp and side == 'BUY':
+                    protection_price = round(float(ltp) * (1 + protect_pct/100.0), 2)
+                elif ltp and side == 'SELL':
+                    protection_price = round(float(ltp) * (1 - protect_pct/100.0), 2)
+                else:
+                    protection_price = 0
+            except Exception:
+                protection_price = 0
+
+            order_data = {
+                "symbol": symbol,
+                "qty": qty,
+                "type": 2,  # 2 = Market order (fallback)
+                "side": 1 if side == "BUY" else -1,  # 1 = Buy, -1 = Sell
+                "productType": "INTRADAY",
+                "validity": "DAY",
+                "offlineOrder": False,
+                "stopPrice": 0,
+                "limitPrice": 0,
+                "protectionPrice": protection_price,
+                "marketProtection": True
+            }
+            response = fyers.place_order(data=order_data)
+            logging.info(f"Order placed (fallback market): {symbol} {side} {qty} - Response: {response}")
+            return response
     except Exception as e:
         logging.error(f"Error placing order: {str(e)}")
         return None
@@ -134,6 +183,28 @@ def place_limit_order(fyers, symbol, qty, side, limit_price):
         Order response from Fyers API
     """
     try:
+        # Compute protectionPrice if configured
+        try:
+            cfg = load_config()
+            protect_pct = float(cfg.get('strategy', {}).get('protection_price_pct', 0.2))
+        except Exception:
+            protect_pct = 0.2
+        try:
+            # Try to fetch a recent LTP to derive protection price; fall back to limit_price
+            ltp = get_ltp(fyers, symbol)
+        except Exception:
+            ltp = None
+        try:
+            if ltp is not None and ltp > 0:
+                if side == 'BUY':
+                    protection_price = round(float(ltp) * (1 + protect_pct/100.0), 2)
+                else:
+                    protection_price = round(float(ltp) * (1 - protect_pct/100.0), 2)
+            else:
+                protection_price = limit_price
+        except Exception:
+            protection_price = limit_price
+
         order_data = {
             "symbol": symbol,
             "qty": qty,
@@ -143,7 +214,9 @@ def place_limit_order(fyers, symbol, qty, side, limit_price):
             "validity": "DAY",
             "offlineOrder": False,
             "stopPrice": 0,
-            "limitPrice": limit_price
+            "limitPrice": limit_price,
+            "protectionPrice": protection_price,
+            "marketProtection": True
         }
         
         response = fyers.place_order(data=order_data)
@@ -168,6 +241,25 @@ def place_sl_order(fyers, symbol, qty, side, trigger_price):
         Order response from Fyers API
     """
     try:
+        try:
+            cfg = load_config()
+            protect_pct = float(cfg.get('strategy', {}).get('protection_price_pct', 0.2))
+        except Exception:
+            protect_pct = 0.2
+        try:
+            ltp = get_ltp(fyers, symbol)
+        except Exception:
+            ltp = None
+        try:
+            if ltp and side == 'BUY':
+                protection_price = round(float(ltp) * (1 + protect_pct/100.0), 2)
+            elif ltp and side == 'SELL':
+                protection_price = round(float(ltp) * (1 - protect_pct/100.0), 2)
+            else:
+                protection_price = trigger_price
+        except Exception:
+            protection_price = trigger_price
+
         order_data = {
             "symbol": symbol,
             "qty": qty,
@@ -177,7 +269,9 @@ def place_sl_order(fyers, symbol, qty, side, trigger_price):
             "validity": "DAY",
             "offlineOrder": False, 
             "stopPrice": trigger_price,
-            "limitPrice": 0
+            "limitPrice": 0,
+            "protectionPrice": protection_price,
+            "marketProtection": True
         }
         
         response = fyers.place_order(data=order_data)
@@ -203,6 +297,25 @@ def place_sl_limit_order(fyers, symbol, qty, side, trigger_price, limit_price):
         Order response from Fyers API
     """
     try:
+        try:
+            cfg = load_config()
+            protect_pct = float(cfg.get('strategy', {}).get('protection_price_pct', 0.2))
+        except Exception:
+            protect_pct = 0.2
+        try:
+            ltp = get_ltp(fyers, symbol)
+        except Exception:
+            ltp = None
+        try:
+            if ltp and side == 'BUY':
+                protection_price = round(float(ltp) * (1 + protect_pct/100.0), 2)
+            elif ltp and side == 'SELL':
+                protection_price = round(float(ltp) * (1 - protect_pct/100.0), 2)
+            else:
+                protection_price = limit_price
+        except Exception:
+            protection_price = limit_price
+
         order_data = {
             "symbol": symbol,
             "qty": qty,
@@ -212,7 +325,9 @@ def place_sl_limit_order(fyers, symbol, qty, side, trigger_price, limit_price):
             "validity": "DAY",
             "offlineOrder": False,
             "stopPrice": trigger_price,
-            "limitPrice": limit_price
+            "limitPrice": limit_price,
+            "protectionPrice": protection_price,
+            "marketProtection": True
         }
         
         response = fyers.place_order(data=order_data)

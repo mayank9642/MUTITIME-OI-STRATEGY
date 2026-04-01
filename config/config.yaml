@@ -1,9 +1,9 @@
 fyers:
-  access_token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiZDoxIiwiZDoyIiwieDowIiwieDoxIiwieDoyIl0sImF0X2hhc2giOiJnQUFBQUFCcHVoNWhUQUNKaFh4VGZObENpRzlhMENjNnctSENhMHR0SVJsU3daVXFBX0VrR3dpby1wVEhpZTRVcEwwcDZ2MmxRVHM2a19NeGZwOHJzTHZOT21YVkZXMXUxcU40TzdxU2VrLUZHVmhpZFJxR2Y5ST0iLCJkaXNwbGF5X25hbWUiOiIiLCJvbXMiOiJLMSIsImhzbV9rZXkiOiI0MjJlNGNhN2YyYjFjNTI3ZjlhYTViNzg2OGFmNzdlNmE3NWYyN2QyYjJmNGI1NzdkNjVkZjM0ZCIsImlzRGRwaUVuYWJsZWQiOiJOIiwiaXNNdGZFbmFibGVkIjoiTiIsImZ5X2lkIjoiWU0wNDA3NyIsImFwcFR5cGUiOjEwMCwiZXhwIjoxNzczODgwMjAwLCJpYXQiOjE3NzM4MDUxNTMsImlzcyI6ImFwaS5meWVycy5pbiIsIm5iZiI6MTc3MzgwNTE1Mywic3ViIjoiYWNjZXNzX3Rva2VuIn0.kmXgGgo5szPDttufrnA-5gEILKSyHtzRgipFn3-ADbw
-  client_id: QZAWYQ69KZ-100
+  access_token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiZDoxIiwiZDoyIiwieDowIiwieDoxIiwieDoyIl0sImF0X2hhc2giOiJnQUFBQUFCcHpKUkNpdDV4bE1UR1cxd21tOWdyMVkyaW5vbndfeU1jdmlHemowQ1hGRUFPYjBlWm1CMjQzVWdJR0MzMElUVXJ6T1gtVXpNV2RzVjBGczdEYWw4d0Q4QTVOYkt3M0ljUWxGWnZPUVd6Nnk3YlVHVT0iLCJkaXNwbGF5X25hbWUiOiIiLCJvbXMiOiJLMSIsImhzbV9rZXkiOiI5MTg2OTgzMTBiZDI4M2QwNGZlNjI5Y2M5YjExMDc2YzlmM2U5M2U4OTdjZjc5ZTQxMDk5MDM2OSIsImlzRGRwaUVuYWJsZWQiOiJOIiwiaXNNdGZFbmFibGVkIjoiTiIsImZ5X2lkIjoiWU0wNDA3NyIsImFwcFR5cGUiOjIwMCwiZXhwIjoxNzc1MDg5ODAwLCJpYXQiOjE3NzUwMTQ5NzgsImlzcyI6ImFwaS5meWVycy5pbiIsIm5iZiI6MTc3NTAxNDk3OCwic3ViIjoiYWNjZXNzX3Rva2VuIn0.BqcKaBYwlxA9d7GqyG95Qv3Z1uPBec25ua5EcDQMSJs
+  client_id: HVMLS7T82E-200
   redirect_uri: https://trade.fyers.in/api-login/redirect-uri/index.html
-  secret_key: J02WG5J3V9
-  token_expiry: '2026-03-19 09:09:13'
+  secret_key: DTjLilYHSz1X4K64
+  token_expiry: '2026-04-02 09:12:58'
   totp_key: ''
 logging:
   file: logs/strategy.log
@@ -11,6 +11,8 @@ logging:
 strategy:
   analysis_time: 09:20
   breakout_pct: 10
+  lot_size_map:
+    NIFTY: 65
   max_holding_minutes: 30
   max_strike_distance: 500
   min_premium_threshold: 50.0
@@ -21,17 +23,19 @@ strategy:
   - exit_percentage: 40
     min_profit_pct: 12
     time_minutes: 20
+  quantity: 1
+  quantity_is_lots: true
   risk_reward_ratio: 2
   stoploss_pct: 20
   symbol: NSE:NIFTY50-INDEX
-  trailing_stop_pct: 8
-  trailing_trigger_pct: 12
-  use_trailing_stop: true
   trailing:
-    prefer_amend: true
-    min_move_pct: 0.5
     cooldown_secs: 30
     max_modifications: 20
+    min_move_pct: 0.5
+    prefer_amend: true
   trailing_modify:
     retry_count: 2
     retry_delay_secs: 0.5
+  trailing_stop_pct: 8
+  trailing_trigger_pct: 12
+  use_trailing_stop: true

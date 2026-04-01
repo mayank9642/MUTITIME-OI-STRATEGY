@@ -61,36 +61,48 @@ def ensure_valid_token(use_totp=False, max_retries=3):
     retry_count = 0
     retry_delay = 2  # Initial delay in seconds
     
+    # Only attempt automatic generation of a token if a TOTP key is configured.
+    # FYERS regulatory changes may require interactive 2FA daily; if no TOTP
+    # key is available in config, do not attempt to auto-open an interactive
+    # auth flow here. Instead, return None and let the operator perform the
+    # interactive login (see README or src/auth.py).
+    try:
+        config = load_config()
+    except Exception:
+        config = {}
+
+    totp_key = config.get('fyers', {}).get('totp_key')
+
+    # If token still valid, return it
+    if is_token_valid():
+        try:
+            config = load_config()
+            token = config['fyers']['access_token']
+            logging.info("Using existing valid access token")
+            return token
+        except Exception:
+            logging.error("Token validity reported true but could not read token from config")
+            return None
+
+    # Token is invalid/expired at this point
+    if not totp_key:
+        logging.critical(
+            "Access token expired and no TOTP key is configured.\n"
+            "Due to regulatory changes, automatic refresh may not be available.\n"
+            "Please run the interactive auth flow now (e.g. `python -m src.auth`) to re-authorize the App ID, or configure a TOTP key in config/config.yaml if a non-interactive flow is supported."
+        )
+        return None
+
+    # TOTP key is present: attempt non-interactive TOTP-based auth (may open browser or use API depending on implementation)
     while retry_count < max_retries:
         try:
-            # First check if we have a valid token
-            if is_token_valid():
-                config = load_config()
-                token = config['fyers']['access_token']
-                logging.info("Using existing valid access token")
+            logging.info(f"Generating new access token using TOTP (attempt {retry_count + 1}/{max_retries})...")
+            token = generate_access_token(use_totp=True)
+            if token:
+                logging.info("Generated new access token using TOTP")
                 return token
-            else:
-                # Token is missing or expired, generate a new one
-                logging.info(f"Generating new access token (attempt {retry_count + 1}/{max_retries})...")
-                token = generate_access_token(use_totp)
-                if token:
-                    # Verify the token actually works by making a simple API call
-                    from src.fyers_api_utils import get_fyers_client
-                    fyers = get_fyers_client(check_token=False)  # Use the new token
-                    if fyers:
-                        try:
-                            # Test with a simple API call
-                            profile = fyers.get_profile()
-                            if isinstance(profile, dict) and profile.get('s') == 'ok':
-                                logging.info("Successfully generated and verified new access token")
-                                return token
-                            else:
-                                logging.warning(f"Generated token verification failed: {profile}")
-                        except Exception as verify_error:
-                            logging.error(f"Error verifying new token: {str(verify_error)}")
-                    else:
-                        logging.info("Successfully generated new access token")
-                        return token
+        except Exception as e:
+            logging.error(f"Token generation error (attempt {retry_count + 1}/{max_retries}): {str(e)}")
         except Exception as e:
             logging.error(f"Token error (attempt {retry_count + 1}/{max_retries}): {str(e)}")
         

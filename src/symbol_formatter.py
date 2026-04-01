@@ -30,7 +30,7 @@ def convert_option_symbol_format(symbol: Optional[str]) -> Optional[str]:
 
     try:
         # Fast path: already compact/canonical
-        if re.match(r"^(NSE:)?(NIFTY|BANKNIFTY)\d{2}[A-Z]{3}\d{2,4}\d{4,5}(CE|PE)$", symbol, re.IGNORECASE):
+        if re.match(r"^(NSE:)?NIFTY\d{2}[A-Z]{3}\d{2,4}\d{4,5}(CE|PE)$", symbol, re.IGNORECASE):
             return _ensure_prefix("NSE:", symbol)
 
         # If the token doesn't look like an option, leave as-is
@@ -63,12 +63,13 @@ def convert_option_symbol_format(symbol: Optional[str]) -> Optional[str]:
 
         # Fallback: regex extraction from messy strings
         m = re.search(
-            r"(NIFTY|BANKNIFTY)[-_]?(\d{1,2})[-_]?([A-Z]{3})[-_]?((?:\d{2})|(?:\d{4}))[-_]?(\d{4,5})[-_]?([CP]E)",
+            r"NIFTY[-_]?(\d{1,2})[-_]?([A-Z]{3})[-_]?((?:\d{2})|(?:\d{4}))[-_]?(\d{4,5})[-_]?([CP]E)",
             rest,
             re.IGNORECASE,
         )
         if m:
-            underlying, day, month, year, strike, option_type = m.groups()
+            day, month, year, strike, option_type = m.groups()
+            underlying = 'NIFTY'
             day = day.zfill(2)
             month = month.upper()[:3]
             if len(year) == 4:

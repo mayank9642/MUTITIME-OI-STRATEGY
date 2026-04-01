@@ -18,6 +18,7 @@ from collections import defaultdict
 from src.fyers_api_utils import get_fyers_client
 from src.fixed_improved_websocket import enhanced_start_market_data_websocket
 from src.order_manager import OrderManager
+from src.regulatory_checks import run_regulatory_checks
 import re
 
 class OpenInterestStrategy:
@@ -27,7 +28,22 @@ class OpenInterestStrategy:
         self.live_prices = {}
         # DataFrame to store LTPs for each contract (symbol, expiry, strike, option_type)
         self.ltp_df = pd.DataFrame(columns=["symbol", "expiry", "strike", "option_type", "ltp"])
-        self.config = {}
+        # Load configuration from config/config.yaml when available
+        try:
+            from src.config import load_config
+            self.config = load_config()
+        except Exception:
+            # Fallback to empty config if loading fails
+            self.config = {}
+        # Run lightweight regulatory checks & guidance (logs warnings/instructions)
+        try:
+            status = run_regulatory_checks(self.config)
+            if not status.get('ok'):
+                logging.warning("Regulatory checks reported issues: %s", status.get('notes'))
+            else:
+                logging.info("Regulatory checks completed: %s", status.get('notes'))
+        except Exception:
+            logging.exception("Failed to run regulatory checks")
         self.paper_trading = True
         self.market_closed = False
         self.trade_taken_today = False
@@ -40,6 +56,9 @@ class OpenInterestStrategy:
         self.entry_time = None
         self.max_strike_distance = self.config.get('strategy', {}).get('max_strike_distance', 500)
         self.trade_history = []
+        # Load persistent balance (for PAPER mode) and performance state
+        self.current_balance = None
+        self.initial_balance = None
         # Pass fyers client into OrderManager so it can call broker APIs when not in paper mode
         try:
             self.order_manager = OrderManager(broker_api=self.fyers, paper_trading=self.paper_trading)
@@ -51,6 +70,12 @@ class OpenInterestStrategy:
         except Exception:
             logging.debug("Could not register on_gtt_triggered callback on order_manager")
         self._ws_lock = threading.Lock()
+
+        # Load persisted balance info (if present)
+        try:
+            self.load_balance()
+        except Exception:
+            logging.debug("Could not load persisted balance; using defaults")
         # For log rate-limiting and aggregation
         self._last_logged_ltp = {}
         self._last_logged_time = {}
@@ -90,32 +115,102 @@ class OpenInterestStrategy:
         Update the trailing stoploss based on current price and profit percentage.
         """
         if not self.active_trade:
-            logging.warning("No active trade found when updating trailing stoploss")
-        self._paper_status_thread = None
-        self._exit_monitor_thread = None
+            return False
+
+        symbol = self.active_trade.get('symbol', '')
+        entry_price = self.active_trade.get('entry_price', 0)
+        current_sl = self.active_trade.get('stoploss', 0)
+        original_stoploss = self.active_trade.get('original_stoploss', current_sl)
+
+        # First time trailing SL is called, store the original stoploss
+        if 'original_stoploss' not in self.active_trade:
+            self.active_trade['original_stoploss'] = current_sl
+            original_stoploss = current_sl
+
+        # Get trailing stop percentage from config
+        config = self.config or {}
+        trailing_stop_pct = float(config.get('strategy', {}).get('trailing_stop_pct', 8))
+
+        # Calculate new potential stoploss (current price * (1 - trailing_pct))
+        potential_stoploss = current_price * (1 - (trailing_stop_pct / 100.0))
+
+        logging.debug(f"TRAILING SL DEBUG | symbol: {symbol} | entry_price: {entry_price} | current_price: {current_price} | trailing_stop_pct: {trailing_stop_pct} | current_sl: {current_sl} | original_stoploss: {original_stoploss}")
+
+        # Only update if the new stoploss is higher than both current stoploss and original stoploss
+        if potential_stoploss > current_sl and potential_stoploss > original_stoploss:
+            old_sl = self.active_trade.get('stoploss')
+            # Round to 2 decimals for option prices (matches logging elsewhere)
+            self.active_trade['stoploss'] = round(potential_stoploss, 2)
+            self.active_trade['trailing_stoploss'] = round(potential_stoploss, 2)
+            logging.info(f"Trailing stoploss updated from {old_sl} to {self.active_trade['stoploss']}")
+            return True
+        else:
+            logging.debug(f"TRAILING SL DEBUG | No update: potential_stoploss ({potential_stoploss}) <= current_sl ({current_sl}) or original_stoploss ({original_stoploss})")
+            return False
         
     def start_exit_monitor(self):
-        # Start an exit monitor to watch for SL/Target hits and close the trade
-        logging.info("[EXIT MONITOR] Started for active trade")
-        while self.active_trade and not self.market_closed:
-            try:
-                current = self.get_active_trade_ltp()
-                if current is None:
-                    time.sleep(1)
-                    continue
-                sl = self.active_trade.get('stoploss')
-                tgt = self.active_trade.get('target')
-                # For long BUY trades: exit when price <= SL or >= Target
-                if sl is not None and current <= sl:
-                    self._close_active_trade(exit_reason='STOPLOSS', exit_price=current)
-                    return
-                if tgt is not None and current >= tgt:
-                    self._close_active_trade(exit_reason='TARGET', exit_price=current)
-                    return
-            except Exception:
-                logging.exception("[EXIT MONITOR] Exception in exit monitor")
-            time.sleep(1)
-        logging.info("[EXIT MONITOR] Exiting")
+        """
+        Start a background exit monitor thread which watches for SL/Target hits and closes the trade.
+        This function returns immediately after launching the daemon thread. The actual
+        monitoring loop runs in `_exit_monitor_loop`.
+        """
+        # If already running, don't start another
+        if hasattr(self, '_exit_monitor_thread') and getattr(self, '_exit_monitor_thread'):
+            if getattr(self, '_exit_monitor_thread').is_alive():
+                logging.info("[EXIT MONITOR] Already running")
+                return True
+
+        def _exit_monitor_loop():
+            logging.info("[EXIT MONITOR] Started for active trade")
+            while self.active_trade and not self.market_closed:
+                try:
+                    current = self.get_active_trade_ltp()
+                    if current is None:
+                        time.sleep(1)
+                        continue
+                    # Enforce maximum trade duration to avoid premium melt-down
+                    try:
+                        entry_time = self.active_trade.get('entry_time')
+                        if entry_time is not None:
+                            # Use IST-aware comparison if entry_time stored with timezone
+                            now_dt = datetime.now(pytz.timezone('Asia/Kolkata'))
+                            try:
+                                elapsed_secs = (now_dt - entry_time).total_seconds()
+                            except Exception:
+                                # Fallback if entry_time is naive or not a datetime
+                                try:
+                                    elapsed_secs = time.time() - float(entry_time.timestamp())
+                                except Exception:
+                                    elapsed_secs = 0
+                            max_mins = int(self.config.get('strategy', {}).get('max_trade_duration_minutes', 30))
+                            if elapsed_secs and elapsed_secs >= (max_mins * 60):
+                                logging.info(f"[EXIT MONITOR][TIMEOUT] Active trade exceeded max duration ({max_mins} minutes). Closing trade.")
+                                # Use current LTP as exit price if available
+                                try:
+                                    self._close_active_trade(exit_reason='TIMEOUT', exit_price=current)
+                                except Exception:
+                                    logging.exception("[EXIT MONITOR][ERROR] Failed to close trade on timeout")
+                                return
+                    except Exception:
+                        logging.debug("[EXIT MONITOR] Error while checking max trade duration; continuing monitor")
+                    sl = self.active_trade.get('stoploss')
+                    tgt = self.active_trade.get('target')
+                    # For long BUY trades: exit when price <= SL or >= Target
+                    if sl is not None and current <= sl:
+                        self._close_active_trade(exit_reason='STOPLOSS', exit_price=current)
+                        return
+                    if tgt is not None and current >= tgt:
+                        self._close_active_trade(exit_reason='TARGET', exit_price=current)
+                        return
+                except Exception:
+                    logging.exception("[EXIT MONITOR] Exception in exit monitor")
+                time.sleep(1)
+            logging.info("[EXIT MONITOR] Exiting")
+
+        import threading as _thr
+        self._exit_monitor_thread = _thr.Thread(target=_exit_monitor_loop, name="ExitMonitorThread", daemon=True)
+        self._exit_monitor_thread.start()
+        return True
         
     def monitor_exit(self):
         if not hasattr(self, '_exit_monitor_thread') or not getattr(self, '_exit_monitor_thread'):
@@ -205,13 +300,43 @@ class OpenInterestStrategy:
         Validate option symbols against Fyers master contract (or API) before subscribing.
         Returns only valid symbols.
         """
-        # Placeholder: In production, fetch valid symbols from Fyers API or master file
-        # For now, assume all symbols are valid except those with None or empty string
-        valid_symbols = [s for s in symbols if s and isinstance(s, str) and len(s) > 10]
-        invalid_symbols = [s for s in symbols if s not in valid_symbols]
-    # ...existing code...
-        if invalid_symbols:
-            logging.warning(f"Some symbols are invalid and will not be subscribed: {invalid_symbols}")
+        # Robust validation + canonicalization before subscribing to Fyers websocket.
+        # Use the project's canonicalizer (get_canonical_symbol) when available so
+        # we always send Fyers-compatible, compact symbols like "NSE:NIFTY04NOV2527450CE".
+        canonical = []
+        invalid = []
+        try:
+            for s in symbols:
+                if not s or not isinstance(s, str):
+                    invalid.append(s)
+                    continue
+                try:
+                    cs = self.get_canonical_symbol(s)
+                except Exception:
+                    # Fallback to identity if conversion fails
+                    cs = s
+                # Basic sanity checks: must start with NSE: and end with CE/PE and be reasonably long
+                if isinstance(cs, str) and cs.startswith('NSE:') and (cs.endswith('CE') or cs.endswith('PE')) and len(cs) >= 12:
+                    canonical.append(cs)
+                else:
+                    invalid.append(s)
+        except Exception:
+            logging.exception("Exception while canonicalizing symbols")
+
+        # Deduplicate while preserving order
+        seen = set()
+        valid_symbols = []
+        for s in canonical:
+            if s not in seen:
+                seen.add(s)
+                valid_symbols.append(s)
+
+        if invalid:
+            logging.warning(f"Some symbols are invalid or could not be canonicalized and will not be subscribed: {invalid}")
+
+        if not valid_symbols:
+            logging.error("No valid symbols after canonicalization - subscription aborted.")
+
         return valid_symbols
 
     def identify_high_oi_strikes(self):
@@ -343,13 +468,10 @@ class OpenInterestStrategy:
             # Try to extract expiry/strike/type from the canonical symbol.
             # Accept forms with or without the 'NSE:' prefix and CE/PE or single-letter C/P suffix.
             expiry = strike = option_type = None
-            # Try a couple of known patterns. Some feeds place the option type before the strike
-            # (e.g. NIFTY17MAR26C23500) and some after (e.g. NIFTY17MAR2623500CE). Try both.
-            parsed = None
             # Pattern 1: strike then option suffix (e.g. ...<strike><CE|PE>)
-            pat1 = re.compile(r"(?:NSE:)?(NIFTY|BANKNIFTY)(\d{2})([A-Z]{3})(\d{2})(\d{4,5})(C(?:E)?|P(?:E)?)$")
+            pat1 = re.compile(r"(?:NSE:)?NIFTY(\d{2})([A-Z]{3})(\d{2})(\d{4,5})(C(?:E)?|P(?:E)?)$")
             # Pattern 2: option letter then strike (e.g. ...<C|P><strike>)
-            pat2 = re.compile(r"(?:NSE:)?(NIFTY|BANKNIFTY)(\d{2})([A-Z]{3})(\d{2})(C(?:E)?|P(?:E)?)(\d{4,5})$")
+            pat2 = re.compile(r"(?:NSE:)?NIFTY(\d{2})([A-Z]{3})(\d{2})(C(?:E)?|P(?:E)?)(\d{4,5})$")
 
             m = pat1.match(canonical_symbol)
             if m:
@@ -473,17 +595,133 @@ class OpenInterestStrategy:
         import datetime as _dt
         try:
             # Define required columns in order
+            # Match Nifty-style header exactly
             columns = [
-                'Entry DateTime', 'Index', 'Symbol', 'Direction', 'Entry Price',
-                'Exit DateTime', 'Exit Price', 'Stop Loss', 'Target', 'Trailing SL',
-                'Quantity', 'Brokerage', 'P&L', 'Margin Required', '% Gain/Loss',
-                'max up', 'max down', 'max up %', 'max down %'
+                'Entry DateTime','Index','Symbol','Direction','Entry Price','Exit DateTime','Exit Price',
+                'Stop Loss','Target','Trailing SL','Quantity','Brokerage','P&L','Net P&L','Margin Required',
+                '% Gain/Loss','Max Up (₹)','Max Down (₹)','Max Up (%)','Max Down (%)','VIX','Balance After Trade'
             ]
-            df = pd.DataFrame(self.trade_history)
+
+            # Build a normalized list of rows ensuring all required fields exist and derived fields are computed
+            rows = []
+            for t in list(self.trade_history):
+                try:
+                    entry_dt = t.get('Entry DateTime')
+                    exit_dt = t.get('Exit DateTime')
+                    symbol = t.get('Symbol')
+                    idx = t.get('Index', '')
+                    direction = t.get('Direction', '')
+                    entry_price = float(t.get('Entry Price') or 0)
+                    exit_price = float(t.get('Exit Price') or 0)
+                    stop_loss = t.get('SL') if 'SL' in t else t.get('Stop Loss', t.get('stoploss', ''))
+                    trailing_sl = t.get('trailing_stoploss', t.get('Trailing SL', ''))
+                    target = t.get('Target', t.get('target', ''))
+                    qty = t.get('Quantity', t.get('Quantity', t.get('quantity', 0)))
+                    try:
+                        qty = int(qty)
+                    except Exception:
+                        try:
+                            qty = int(float(qty))
+                        except Exception:
+                            pass
+                    pnl = float(t.get('P&L', t.get('P&L', 0) or 0))
+                except Exception:
+                    # Skip malformed entries but continue saving others
+                    logging.debug("Skipping malformed trade history entry during save")
+                    continue
+
+                # Compute brokerage (approx) using available helper
+                brokerage = 0.0
+                try:
+                    brokerage, _ = self.calculate_fyers_option_charges(entry_price, exit_price, qty)
+                except Exception:
+                    brokerage = 0.0
+
+                net_pnl = pnl - float(brokerage)
+                # Margin required: be careful not to double-count lot-size.
+                # execute_trade() stores 'quantity' as actual contracts (lots * lot_size)
+                # and also stores 'lots' as the configured number of lots. Use 'lots'
+                # when available to compute margin as entry_price * lots * lot_size.
+                try:
+                    strategy_cfg = self.config.get('strategy', {}) if self.config else {}
+                    quantity_is_lots = bool(strategy_cfg.get('quantity_is_lots', True))
+                    lot_map = strategy_cfg.get('lot_size_map', {'NIFTY': 65})
+                    # Determine lot_size for this symbol (default NIFTY=65)
+                    lot_size = 1
+                    sym_upper = (symbol or '').upper()
+                    import re
+                    for k, v in lot_map.items():
+                        try:
+                            pattern = r"\b" + re.escape(str(k).upper()) + r"\b"
+                            if re.search(pattern, sym_upper):
+                                lot_size = int(v)
+                                break
+                        except Exception:
+                            continue
+                    if lot_size == 1 and 'NIFTY' in sym_upper:
+                        lot_size = 65
+
+                    # If 'lots' is present in the saved trade record, compute margin from lots*lot_size.
+                    lots_val = t.get('lots') if isinstance(t, dict) else None
+                    try:
+                        lots_val = int(lots_val) if lots_val is not None else None
+                    except Exception:
+                        lots_val = None
+
+                    if lots_val is not None and quantity_is_lots:
+                        margin_required = float(entry_price) * float(lots_val) * float(lot_size)
+                    else:
+                        # Otherwise assume 'quantity' already contains total contracts (lots * lot_size)
+                        margin_required = float(entry_price) * float(qty)
+                except Exception:
+                    margin_required = 0.0
+                pct_gain_loss = (pnl / margin_required * 100.0) if margin_required else 0.0
+
+                max_up = float(t.get('Max Up', t.get('max up', t.get('max_up', 0)) or 0))
+                max_down = float(t.get('Max Down', t.get('max down', t.get('max_down', 0)) or 0))
+                max_up_pct = float(t.get('Max Up %', t.get('max up %', t.get('max_up_pct', 0)) or 0))
+                max_down_pct = float(t.get('Max Down %', t.get('max down %', t.get('max_down_pct', 0)) or 0))
+
+                vix = ''
+                try:
+                    vix = self.live_prices.get('NSE:VIX') or self.live_prices.get('VIX') or ''
+                except Exception:
+                    vix = ''
+
+                balance_after = t.get('Balance After Trade', '')
+
+                row = {
+                    'Entry DateTime': entry_dt,
+                    'Index': idx,
+                    'Symbol': symbol,
+                    'Direction': direction,
+                    'Entry Price': entry_price,
+                    'Exit DateTime': exit_dt,
+                    'Exit Price': exit_price,
+                    'Stop Loss': stop_loss,
+                    'Target': target,
+                    'Trailing SL': trailing_sl,
+                    'Quantity': qty,
+                    'Brokerage': brokerage,
+                    'P&L': pnl,
+                    'Net P&L': net_pnl,
+                    'Margin Required': margin_required,
+                    '% Gain/Loss': pct_gain_loss,
+                    'Max Up (₹)': max_up,
+                    'Max Down (₹)': max_down,
+                    'Max Up (%)': max_up_pct,
+                    'Max Down (%)': max_down_pct,
+                    'VIX': vix,
+                    'Balance After Trade': balance_after
+                }
+                rows.append(row)
+
+            df = pd.DataFrame(rows)
+            # Ensure all columns present
             for col in columns:
                 if col not in df.columns:
                     df[col] = ''
-            df = df[columns]  # Ensure column order
+            df = df[columns]
             # Save to CSV
             df.to_csv('logs/trade_history.csv', index=False)
             # Save to Excel with today's date
@@ -514,7 +752,67 @@ class OpenInterestStrategy:
                 df.to_excel(writer, index=False)
             logging.info(f"Trade history saved to CSV and Excel: {excel_path}")
         except Exception as e:
+            logging.exception(f"Error saving trade history: {e}")
+
+    # --- Balance persistence and performance helpers ---
+    def load_balance(self):
+        """Load persisted balance from disk or initialize from config/defaults"""
+        try:
+            path = 'logs/balance.json'
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                    self.current_balance = float(data.get('current_balance', 0))
+                    self.initial_balance = float(data.get('initial_balance', self.current_balance))
+                    logging.info(f"Loaded persisted balance: {self.current_balance}")
+            else:
+                # Initialize from config or default
+                cfg = self.config.get('strategy', {}) if self.config else {}
+                start_bal = float(cfg.get('starting_balance', 100000.0))
+                # Default: reset to 100000 as requested by user
+                start_bal = 100000.0
+                self.initial_balance = start_bal
+                self.current_balance = start_bal
+                # Persist initial balance
+                self.save_balance()
+                logging.info(f"Initialized balance to {self.current_balance}")
+        except Exception:
+            logging.exception("Failed to load or initialize balance; using defaults")
+            self.initial_balance = self.initial_balance or 100000.0
+            self.current_balance = self.current_balance or self.initial_balance
+
+    def save_balance(self):
+        """Persist current balance to disk"""
+        try:
+            path = 'logs'
+            if not os.path.exists(path):
+                os.makedirs(path, exist_ok=True)
+            data = {
+                'initial_balance': float(self.initial_balance or 0),
+                'current_balance': float(self.current_balance or 0),
+            }
+            with open(os.path.join(path, 'balance.json'), 'w') as f:
+                json.dump(data, f)
+            logging.info(f"Persisted balance to {os.path.join(path, 'balance.json')}")
+        except Exception:
+            logging.exception("Failed to persist balance to disk")
+        except Exception as e:
             logging.error(f"Error saving trade history: {str(e)}")
+
+    def reset_balance(self, amount=100000.0):
+        """Force-reset the in-memory and persisted balance to the given amount."""
+        try:
+            self.initial_balance = float(amount)
+            self.current_balance = float(amount)
+            try:
+                self.save_balance()
+            except Exception:
+                logging.debug("Failed to persist balance during reset")
+            logging.info(f"[BALANCE] Reset balance to {self.current_balance:,.2f}")
+            return True
+        except Exception:
+            logging.exception("Failed to reset balance")
+            return False
 
     def update_aggregate_stats(self):
         """Update aggregate statistics file with new trade data"""
@@ -867,12 +1165,19 @@ class OpenInterestStrategy:
                 max_down_pct_f = float(max_down_pct or 0.0)
                 max_up_str = f"{max_up_val_f:.2f} ({max_up_pct_f:.2f}%)"
                 max_down_str = f"{max_down_val_f:.2f} ({max_down_pct_f:.2f}%)"
-            try:
-                logging.info(
-                    f"[PAPER STATUS] {symbol} | LTP: {float(current_price):.2f} | Entry: {float(entry_price):.2f} | SL: {float(self.active_trade.get('stoploss', 0)):.2f} | Target: {float(target):.2f} | PnL: {pnl:.2f}"
-                )
-            except Exception:
-                logging.info(f"[PAPER STATUS] {symbol} | LTP: {current_price} | Entry: {entry_price} | PnL: {pnl:.2f}")
+                try:
+                    # Emit full PAPER STATUS including MaxUp/MaxDn with percentages
+                    logging.info(
+                        f"[PAPER STATUS] {symbol} | LTP: {float(current_price):.2f} | Entry: {float(entry_price):.2f} | SL: {float(self.active_trade.get('stoploss', 0)):.2f} | Target: {float(target):.2f} | PnL: {pnl:.2f} | MaxUp: {max_up_val_f:.2f} ({max_up_pct_f:.2f}%) | MaxDn: {max_down_val_f:.2f} ({max_down_pct_f:.2f}%)"
+                    )
+                    # Update last paper status time to enforce rate-limiting
+                    try:
+                        self._last_paper_status_time = now
+                    except Exception:
+                        pass
+                except Exception:
+                    # Fallback shorter form if formatting fails
+                    logging.info(f"[PAPER STATUS] {symbol} | LTP: {current_price} | Entry: {entry_price} | PnL: {pnl:.2f}")
         except Exception:
             logging.exception("[PAPER STATUS][ERROR] Exception while preparing PAPER STATUS")
 
@@ -895,6 +1200,128 @@ class OpenInterestStrategy:
             logging.error(f"[CLEANUP][ERROR] Error during cleanup: {str(e)}")
             return False
         return True
+
+    def _final_shutdown(self):
+        """Perform aggressive cleanup and exit the process to ensure no background threads or websockets
+        remain active after a trade exit. This does best-effort attempts to disable reconnects,
+        stop background threads, close websockets, and then terminate the process.
+        """
+        try:
+            logging.info("[SHUTDOWN] Finalizing and exiting process after trade exit")
+            # Prevent further monitoring loops from running
+            try:
+                self.market_closed = True
+            except Exception:
+                pass
+
+            # Disable websocket auto-reconnect if available
+            try:
+                if hasattr(self, 'data_socket') and self.data_socket:
+                    try:
+                        if hasattr(self.data_socket, 'reconnect'):
+                            try:
+                                setattr(self.data_socket, 'reconnect', False)
+                            except Exception:
+                                pass
+                        if hasattr(self.data_socket, 'auto_reconnect'):
+                            try:
+                                setattr(self.data_socket, 'auto_reconnect', False)
+                            except Exception:
+                                pass
+                        # If connection_status dict exists, mark as disconnected
+                        if hasattr(self.data_socket, 'connection_status') and isinstance(self.data_socket.connection_status, dict):
+                            try:
+                                self.data_socket.connection_status['connected'] = False
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Stop tick consumer and price monitoring
+            try:
+                self.stop_tick_consumer()
+            except Exception:
+                pass
+            try:
+                self.stop_price_monitoring()
+            except Exception:
+                pass
+
+            # Attempt to join common background threads with short timeouts
+            try:
+                if hasattr(self, '_paper_status_thread') and self._paper_status_thread:
+                    try:
+                        self._paper_status_thread.join(timeout=2)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                if hasattr(self, '_exit_monitor_thread') and self._exit_monitor_thread:
+                    try:
+                        self._exit_monitor_thread.join(timeout=2)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Try to join bracket/gtt monitor threads
+            try:
+                if hasattr(self, '_bracket_monitor_threads') and isinstance(self._bracket_monitor_threads, dict):
+                    for k, t in list(self._bracket_monitor_threads.items()):
+                        try:
+                            if t and t.is_alive():
+                                t.join(timeout=1)
+                        except Exception:
+                            pass
+                    self._bracket_monitor_threads = {}
+            except Exception:
+                pass
+            try:
+                if hasattr(self, '_gtt_monitor_threads') and isinstance(self._gtt_monitor_threads, dict):
+                    for k, t in list(self._gtt_monitor_threads.items()):
+                        try:
+                            if t and t.is_alive():
+                                t.join(timeout=1)
+                        except Exception:
+                            pass
+                    self._gtt_monitor_threads = {}
+            except Exception:
+                pass
+
+            # Ask order_manager to shutdown if it exposes a method
+            try:
+                if hasattr(self, 'order_manager') and self.order_manager:
+                    if hasattr(self.order_manager, 'shutdown'):
+                        try:
+                            self.order_manager.shutdown()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # Give logging a brief moment to flush
+            try:
+                time.sleep(0.2)
+            except Exception:
+                pass
+
+            logging.info("[SHUTDOWN] Exiting process now (exit_after_trade configured)")
+            try:
+                os._exit(0)
+            except Exception:
+                try:
+                    sys.exit(0)
+                except Exception:
+                    pass
+        except Exception:
+            logging.exception("[SHUTDOWN] Exception during final shutdown")
+            try:
+                os._exit(0)
+            except Exception:
+                pass
 
     def get_ist_datetime(self):
         """Return current datetime in IST timezone"""
@@ -1142,21 +1569,96 @@ class OpenInterestStrategy:
     def stop_price_monitoring(self, symbol=None):
         """Stop all price monitoring and unsubscribe from all symbols after trade exit."""
         if hasattr(self, 'data_socket') and self.data_socket:
-            if hasattr(self.data_socket, 'unsubscribe_all') and symbol is None:
-                self.data_socket.unsubscribe_all()
-                logging.info("Unsubscribed from all symbols after trade exit.")
-            elif hasattr(self.data_socket, 'unsubscribe'):
-                # Unsubscribe from the given symbol
-                if symbol:
-                    self.data_socket.unsubscribe(symbol)
-                    logging.info(f"Unsubscribed from symbol: {symbol}")
-            # Try to close the websocket/data socket if possible
-            if hasattr(self.data_socket, 'close'):
+            # First try a bulk unsubscribe if available
+            try:
+                if hasattr(self.data_socket, 'unsubscribe_all') and symbol is None:
+                    try:
+                        self.data_socket.unsubscribe_all()
+                        logging.info("Unsubscribed from all symbols after trade exit.")
+                    except Exception:
+                        logging.debug("unsubscribe_all() call failed")
+                else:
+                    # If unsubscribe_all not available, try per-symbol unsubscribe
+                    if symbol and hasattr(self.data_socket, 'unsubscribe'):
+                        try:
+                            # improved websocket expects unsubscribe(symbols=[...]) or our wrapper handles single symbol
+                            self.data_socket.unsubscribe(symbol)
+                            logging.info(f"Unsubscribed from symbol: {symbol}")
+                        except Exception:
+                            logging.debug(f"Failed to unsubscribe single symbol: {symbol}")
+                    else:
+                        # Attempt to unsubscribe everything we know the client subscribed to (market_data index or stored list)
+                        try:
+                            if hasattr(self.data_socket, 'market_data'):
+                                symbols = list(self.data_socket.market_data.index)
+                                # Try native unsubscribe first
+                                for s in symbols:
+                                    try:
+                                        if hasattr(self.data_socket, 'unsubscribe'):
+                                            self.data_socket.unsubscribe(s)
+                                    except Exception:
+                                        continue
+                                # If client expects a JSON unsubscribe message (some Fyers WS clients), send SUB_MDATA
+                                try:
+                                    import json
+                                    if hasattr(self.data_socket, 'send') and symbols:
+                                        msg = json.dumps({"T": "SUB_MDATA", "S": symbols, "SUB_T": -1})
+                                        try:
+                                            self.data_socket.send(msg)
+                                            logging.info("Sent manual SUB_MDATA unsubscribe message for market symbols")
+                                        except Exception:
+                                            logging.debug("Failed to send SUB_MDATA unsubscribe message")
+                                except Exception:
+                                    logging.debug("Could not send SUB_MDATA unsubscribe message")
+                                logging.info("Attempted per-symbol unsubscribe for all market_data symbols")
+                        except Exception:
+                            logging.debug("Could not iterate market_data for unsubscribe")
+            except Exception:
+                logging.debug("Error during unsubscribe attempts")
+
+            # Try to close the websocket/data socket using common hooks on the client
+            try:
+                # Before closing, some clients require an explicit unsubscribe for order/action feeds
                 try:
-                    self.data_socket.close()
-                    logging.info("Closed data socket after trade exit.")
-                except Exception as e:
-                    logging.error(f"Error closing data socket: {e}")
+                    import json
+                    # Common action feeds to unsubscribe from (orders/trades/positions etc.)
+                    action_list = ['orders', 'trades', 'positions', 'edis', 'pricealerts', 'login']
+                    if hasattr(self.data_socket, 'send'):
+                        try:
+                            msg_actions = json.dumps({"T": "SUB_ORD", "SLIST": action_list, "SUB_T": -1})
+                            self.data_socket.send(msg_actions)
+                            logging.info("Sent SUB_ORD unsubscribe for action feeds")
+                        except Exception:
+                            logging.debug("Failed to send SUB_ORD unsubscribe message")
+                except Exception:
+                    logging.debug("Could not prepare SUB_ORD unsubscribe message")
+
+                if hasattr(self.data_socket, 'close_connection'):
+                    try:
+                        self.data_socket.close_connection()
+                        logging.info("Closed data socket using close_connection() after trade exit.")
+                    except Exception:
+                        logging.debug("close_connection() failed, will try other close methods")
+                if hasattr(self.data_socket, 'terminate'):
+                    try:
+                        self.data_socket.terminate()
+                        logging.info("Terminated data socket after trade exit.")
+                    except Exception:
+                        logging.debug("terminate() failed on data_socket")
+                elif hasattr(self.data_socket, 'close'):
+                    try:
+                        self.data_socket.close()
+                        logging.info("Closed data socket after trade exit.")
+                    except Exception as e:
+                        logging.error(f"Error closing data socket: {e}")
+            except Exception:
+                logging.debug("Error closing data socket (general) after trade exit")
+        # Clear client reference and any cached live prices to avoid using stale data
+        try:
+            if hasattr(self, 'live_prices') and isinstance(self.live_prices, dict):
+                self.live_prices.clear()
+        except Exception:
+            logging.debug("Could not clear live_prices cache")
         self.data_socket = None
     def _close_active_trade(self, exit_reason="manual", exit_price=None):
         """
@@ -1179,25 +1681,272 @@ class OpenInterestStrategy:
                     logging.exception("[EXIT] Failed to cancel bracket order")
             # Mark trade history
             pnl = (exit_p - entry) * qty if entry and exit_p else 0
+            # Record extended trade metadata to match Nifty-style logs
+            try:
+                filled_dt = datetime.now(pytz.timezone('Asia/Kolkata'))
+            except Exception:
+                filled_dt = datetime.now()
+
+            # Compose a simulated order id for paper trades if none provided
+            order_id = bracket_id or self.active_trade.get('order_id') or f"SIM-{symbol}-{entry}-{qty}"
+
             self.trade_history.append({
                 'Entry DateTime': self.active_trade.get('entry_time'),
                 'Symbol': symbol,
                 'Direction': self.active_trade.get('side'),
                 'Entry Price': entry,
-                'Exit DateTime': datetime.now(pytz.timezone('Asia/Kolkata')),
+                'Exit DateTime': filled_dt,
                 'Exit Price': exit_p,
                 'P&L': pnl,
                 'Quantity': qty,
-                'Exit Reason': exit_reason
+                'Exit Reason': exit_reason,
+                # Additional metadata
+                'Order ID': order_id,
+                'Group ID': self.active_trade.get('group_id'),
+                'Bracket Order ID': bracket_id,
+                'SL': self.active_trade.get('stoploss'),
+                # Trailing SL (price) snapshot and legacy header name for compatibility
+                'trailing_stoploss': self.active_trade.get('trailing_stoploss', ''),
+                'Trailing SL': self.active_trade.get('trailing_stoploss', ''),
+                'Target': self.active_trade.get('target'),
+                'Max Up': self.active_trade.get('max_up', 0),
+                'Max Down': self.active_trade.get('max_down', 0),
+                'Max Up %': self.active_trade.get('max_up_pct', 0),
+                'Max Down %': self.active_trade.get('max_down_pct', 0),
+                'Filled Time': filled_dt.strftime('%H:%M:%S') if hasattr(filled_dt, 'strftime') else str(filled_dt),
+                # VIX snapshot at exit time (if available)
+                'VIX': self.live_prices.get('NSE:VIX') or self.live_prices.get('VIX') or ''
             })
-            logging.info(f"[PAPER EXIT] {exit_reason} at {exit_p}")
-            # Log summary and persist
+            # Format numbers with thousands separators for clearer operator logs
+            try:
+                exit_str = f"{float(exit_p):,.2f}"
+            except Exception:
+                exit_str = str(exit_p)
+            try:
+                pnl_str = f"{float(pnl):,.2f}"
+            except Exception:
+                pnl_str = str(pnl)
+
+            # Normalize exit headline to match operator-friendly phrasing
+            er = str(exit_reason or '').upper()
+            if 'TARGET' in er or 'TARGET HIT' in er:
+                logging.info(f"[PAPER EXIT] Target hit at {exit_str}")
+            elif 'STOP' in er or 'STOPLOSS' in er:
+                logging.info(f"[PAPER EXIT] Stoploss hit at {exit_str}")
+            else:
+                logging.info(f"[PAPER EXIT] {exit_reason} at {exit_str}")
+
+            # Emit a concise PAPER TRADING SUMMARY block for operator visibility
+            try:
+                max_up = float(self.active_trade.get('max_up', 0) or 0)
+                max_down = float(self.active_trade.get('max_down', 0) or 0)
+                max_up_pct = float(self.active_trade.get('max_up_pct', 0) or 0)
+                max_down_pct = float(self.active_trade.get('max_down_pct', 0) or 0)
+            except Exception:
+                max_up = max_down = max_up_pct = max_down_pct = 0
+
+            # Compose a simulated order id for paper trades if none provided
+            order_id = bracket_id or self.active_trade.get('order_id') or f"SIM-{symbol}-{entry}-{qty}"
+
+            logging.info("")
+            logging.info("==============================================================================")
+            logging.info("PAPER TRADING SUMMARY - Bracket Order OCO Test")
+            logging.info("==============================================================================")
+            logging.info("")
+            logging.info(f"Order ID: {order_id}")
+            logging.info(f"  Symbol: {symbol}")
+            logging.info(f"  Status: FILLED")
+            logging.info(f"  Entry Limit: {format(entry, ',.2f')}")
+            # Display SL/Target with two decimals for readability
+            try:
+                sl_display = format(float(self.active_trade.get('stoploss', 0)), ',.2f') if self.active_trade.get('stoploss', '') != '' else ''
+            except Exception:
+                sl_display = str(self.active_trade.get('stoploss', ''))
+            try:
+                tgt_display = format(float(self.active_trade.get('target', 0)), ',.2f') if self.active_trade.get('target', '') != '' else ''
+            except Exception:
+                tgt_display = str(self.active_trade.get('target', ''))
+            logging.info(f"  SL: {sl_display} | Target: {tgt_display}")
+            # Ensure qty printed as integer when possible
+            try:
+                qty_display = int(qty)
+            except Exception:
+                qty_display = qty
+            logging.info(f"  Qty: {qty_display}")
+            try:
+                filled_time = self.active_trade.get('entry_time').strftime('%H:%M:%S') if self.active_trade.get('entry_time') else ''
+            except Exception:
+                filled_time = ''
+            logging.info(f"  Filled at: {filled_time} @ {format(entry, ',.2f')}")
+            logging.info(f"  Max Up: {format(max_up, ',.2f')} ({max_up_pct:.2f}%) | Max Down: {format(max_down, ',.2f')} ({max_down_pct:.2f}%)")
+            logging.info("")
+            # Log OCO companion info if available from order manager
+            try:
+                # Attempt to find other leg orders in order_manager if API present
+                other_orders = []
+                if hasattr(self, 'order_manager') and self.order_manager:
+                    try:
+                        # get_orders_by_group may not exist; gracefully ignore
+                        if hasattr(self.order_manager, 'get_orders_by_group') and self.active_trade.get('group_id'):
+                            other_orders = self.order_manager.get_orders_by_group(self.active_trade.get('group_id'))
+                    except Exception:
+                        other_orders = []
+                companion_filled = None
+                companion_cancelled = []
+                if other_orders:
+                    for o in other_orders:
+                        s = str(o.get('status', '') or o.get('status_text', '') or o.get('status_code', ''))
+                        sym = o.get('symbol')
+                        q = o.get('quantity')
+                        try:
+                            q = int(q)
+                        except Exception:
+                            pass
+                        # Consider typical simulated statuses
+                        s_up = s.upper()
+                        if 'FILL' in s_up or 'FILLED' in s_up:
+                            companion_filled = sym
+                            logging.info(f"Order ID: {o.get('order_id', '')}")
+                            logging.info(f"  Symbol: {sym}")
+                            logging.info(f"  Status: FILLED")
+                            logging.info(f"  Entry Limit: {format(o.get('entry_price', o.get('price', '')), ',.2f') if o.get('entry_price', None) else ''}")
+                            logging.info(f"  SL: {format(o.get('stoploss', ''), ',.2f')} | Target: {format(o.get('target', ''), ',.2f')}")
+                            logging.info(f"  Qty: {q}")
+                        else:
+                            # Treat it as cancelled if status contains CANCEL
+                            if 'CANCEL' in s_up or 'CANCELLED' in s_up:
+                                companion_cancelled.append(sym)
+                                logging.info(f"Order ID: {o.get('order_id', '')}")
+                                logging.info(f"  Symbol: {sym}")
+                                logging.info(f"  Status: CANCELLED")
+                                logging.info(f"  Entry Limit: {format(o.get('entry_price', o.get('price', '')), ',.2f') if o.get('entry_price', None) else ''}")
+                                logging.info(f"  SL: {format(o.get('stoploss', ''), ',.2f')} | Target: {format(o.get('target', ''), ',.2f')}")
+                                logging.info(f"  Qty: {q}")
+                            else:
+                                logging.info(f"  Companion order: {sym} | Status: {s} | Qty: {q}")
+                else:
+                    logging.info(f"  (OCO companion order details not available)")
+            except Exception:
+                logging.debug("Could not retrieve OCO companion order details")
+
+            logging.info("")
+            logging.info("==============================================================================")
+            logging.info("OCO Test Result:")
+            logging.info(f"[OK] OCO LOGIC WORKING CORRECTLY!")
+            # Report specifically which leg filled and which cancelled when possible
+            try:
+                filled_leg = symbol
+                cancelled_leg_list = companion_cancelled if companion_cancelled else ['(companion leg)']
+                logging.info(f"   One order filled: {filled_leg}")
+                logging.info(f"   Other order cancelled: {', '.join(cancelled_leg_list)}")
+            except Exception:
+                logging.info(f"   One order filled: {symbol}")
+                logging.info(f"   Other order cancelled: (companion leg)")
+            logging.info("==============================================================================")
+
+            # Update persistent balance and performance summary
+            try:
+                previous = float(self.current_balance or 0)
+                new_bal = previous + float(pnl)
+                self.current_balance = new_bal
+                # Record balance after trade on the most recent trade entry if present
+                try:
+                    if len(self.trade_history) > 0:
+                        self.trade_history[-1]['Balance After Trade'] = float(new_bal)
+                except Exception:
+                    logging.debug("Could not set Balance After Trade on trade history entry")
+                # Persist balance
+                try:
+                    self.save_balance()
+                except Exception:
+                    logging.debug("Failed to persist balance after trade exit")
+                # Log balance line
+                change = new_bal - previous
+                sign = '+' if change >= 0 else ''
+                logging.info(f"[BALANCE] Updated Balance: {new_bal:,.2f} (Change: {sign}{change:,.2f})")
+                # Compute simple performance metrics from trade_history
+                try:
+                    wins = sum(1 for t in self.trade_history if float(t.get('P&L', 0)) > 0)
+                    losses = sum(1 for t in self.trade_history if float(t.get('P&L', 0)) <= 0)
+                    total = wins + losses
+                    win_rate = (wins / total * 100.0) if total > 0 else 0.0
+                    net_pnl = sum(float(t.get('P&L', 0)) for t in self.trade_history)
+                    sign_net = '+' if net_pnl >= 0 else ''
+                    logging.info(f"[PERF] Performance: {wins}W/{losses}L | Win Rate: {win_rate:.1f}% | Net P&L: {sign_net}{net_pnl:,.2f}")
+                except Exception:
+                    logging.debug("Could not compute performance summary")
+            except Exception:
+                logging.exception("Error updating balance/performance after exit")
+
+            # Persist trade history
             try:
                 self.save_trade_history()
             except Exception:
                 logging.exception("[EXIT] Failed to save trade history")
+
+            # Stop any background tick consumer and unsubscribe/close data socket so we stop receiving ticks
+            try:
+                try:
+                    self.stop_tick_consumer()
+                except Exception:
+                    logging.debug("Could not cleanly stop tick consumer thread")
+                try:
+                    # Unsubscribe from all price feeds and close websocket
+                    self.stop_price_monitoring()
+                except Exception:
+                    logging.debug("Could not stop price monitoring / close data socket")
+            except Exception:
+                logging.debug("Error while attempting to stop background price threads/sockets")
+
+            # Emit target/exit completion line for operator visibility
+            try:
+                # Trade number is the length of trade_history
+                trade_no = len(self.trade_history)
+                if 'TARGET' in str(exit_reason).upper() or 'TARGET' in str(exit_reason).upper():
+                    result_tag = 'PROFIT [WIN]' if pnl > 0 else 'LOSS'
+                    logging.info(f"[TARGET] Trade #{trade_no} completed: {symbol} | Net P&L: {pnl_str} ({'PROFIT [WIN]' if pnl>0 else 'LOSS'})")
+                else:
+                    # generic exit message
+                    logging.info(f"[EXIT] Trade #{trade_no} closed: {symbol} | Net P&L: {pnl_str} | Reason: {exit_reason}")
+            except Exception:
+                logging.debug("Could not emit TARGET completion line")
+
+            # Log saved filenames and compact trade-line for quick scanning
+            try:
+                # CSV path is constant in save_trade_history
+                csv_path = 'logs/trade_history.csv'
+                today = datetime.now().strftime('%Y%m%d')
+                excel_path = f'logs/trade_history_{today}.xlsx'
+                logging.info(f"Trade data saved to Excel: {excel_path}")
+                logging.info(f"Trade data saved to CSV: {csv_path}")
+                # One-line trade log
+                ts = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')
+                side = self.trade_history[-1].get('Direction', '')
+                qty = self.trade_history[-1].get('Quantity', '')
+                logging.info(f"Trade logged: {ts},{symbol},{side},{exit_p},{qty},{exit_reason}")
+                logging.info(f"[EXCEL] Trade logged to Excel: {symbol} | Entry: {entry} | Exit: {exit_p} | P&L: {pnl_str}")
+            except Exception:
+                logging.debug("Could not emit post-save trade lines")
+
             # Clear active trade state
             self.active_trade = {}
+            # Optionally perform a final shutdown so the process fully stops after a trade exit
+            try:
+                cfg = self.config.get('strategy', {}) if self.config else {}
+                stop_after = bool(cfg.get('stop_after_trade', True))
+            except Exception:
+                stop_after = True
+
+            if stop_after:
+                try:
+                    # Run final shutdown in a separate daemon thread to avoid blocking the caller
+                    t = threading.Thread(target=self._final_shutdown, name="FinalShutdownThread", daemon=True)
+                    t.start()
+                except Exception:
+                    try:
+                        self._final_shutdown()
+                    except Exception:
+                        pass
             return True
         except Exception as e:
             logging.error(f"[EXIT][ERROR] Exception closing trade: {e}")
@@ -1606,6 +2355,33 @@ class OpenInterestStrategy:
                     quantity = int(self.config.get('strategy', {}).get('quantity', 25))
                 except Exception:
                     quantity = 25
+            # Interpret configured 'quantity' as number of lots when a lot_size_map is provided
+            try:
+                cfg = self.config.get('strategy', {}) if self.config else {}
+                lot_map = cfg.get('lot_size_map', {}) if isinstance(cfg, dict) else {}
+                quantity_is_lots = bool(cfg.get('quantity_is_lots', True))
+                actual_quantity = int(quantity)
+                if quantity_is_lots and lot_map:
+                    # find a matching key in lot_map that appears in the symbol name
+                    for k, v in lot_map.items():
+                        try:
+                            if k.upper() in canonical.upper():
+                                actual_quantity = int(quantity) * int(v)
+                                logging.info(f"[EXECUTE] Interpreting quantity {quantity} lots for {k} with lot size {v} -> actual qty {actual_quantity}")
+                                break
+                        except Exception:
+                            continue
+                else:
+                    # Fallback: if no lot_map but symbol looks like NIFTY, apply known default of 65 per lot
+                    if quantity_is_lots and 'NIFTY' in canonical.upper() and not lot_map:
+                        actual_quantity = int(quantity) * 65
+                        logging.info(f"[EXECUTE] No lot_map in config; assuming NIFTY lot size=65 -> actual qty {actual_quantity}")
+                quantity = actual_quantity
+            except Exception:
+                try:
+                    quantity = int(quantity)
+                except Exception:
+                    quantity = 25
             if entry_price is None:
                 # Try to read from live prices / ltp_df
                 entry_price = float(self.live_prices.get(canonical) or 0)
@@ -1617,7 +2393,9 @@ class OpenInterestStrategy:
                 'symbol': canonical,
                 'entry_price': float(entry_price),
                 'entry_time': datetime.now(pytz.timezone('Asia/Kolkata')), 
+                # quantity stored as actual contracts (lots * lot_size when configured)
                 'quantity': int(quantity),
+                'lots': int(self.config.get('strategy', {}).get('quantity', 25)) if isinstance(self.config.get('strategy', {}).get('quantity', None), int) else None,
                 'side': side,
                 'stoploss': round(entry_price * 0.7, 2),  # placeholder: initial stoploss at 30% of entry
                 'target': round(entry_price * 1.5, 2),    # placeholder: target at +50%

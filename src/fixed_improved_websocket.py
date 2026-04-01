@@ -12,7 +12,7 @@ import queue
 import random
 import traceback
 from src.config import load_config
-from src.token_helper import ensure_valid_token
+from src.token_helper import ensure_valid_token, is_token_valid
 
 def improved_market_data_websocket(symbols, callback_handler=None, data_type="SymbolUpdate", debug=False):
     """
@@ -35,6 +35,15 @@ def improved_market_data_websocket(symbols, callback_handler=None, data_type="Sy
     access_token = ensure_valid_token()
     if not access_token:
         logging.error("Could not obtain valid token for websocket connection")
+        return None
+    # Double-check token validity (defensive): if helper returned a token but
+    # validity check fails, abort to avoid starting websocket with an expired token.
+    try:
+        if not is_token_valid():
+            logging.critical("Token retrieval succeeded but token is not valid according to is_token_valid(); aborting websocket start.")
+            return None
+    except Exception:
+        logging.exception("Failed to verify token validity after retrieval; aborting websocket start for safety.")
         return None
     
     # Full token format needed for websocket

@@ -287,6 +287,12 @@ class OrderManager:
         with self._lock:
             return [o for o in self.orders.values() if o['symbol'] == symbol]
 
+    def get_orders_by_group(self, group_id):
+        """Return all orders belonging to a group id (GTT OCO groups)"""
+        with self._lock:
+            ids = self.gtt_groups.get(group_id, set()).copy()
+            return [self.orders.get(i) for i in ids if i in self.orders]
+
     def get_orders_by_tag(self, tag):
         with self._lock:
             return [o for o in self.orders.values() if o['tag'] == tag]
