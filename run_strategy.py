@@ -6,6 +6,8 @@ import sys
 import logging
 import logging.handlers
 import datetime
+import time
+import pytz
 import subprocess
 import atexit
 
@@ -225,6 +227,48 @@ def run_strategy():
 
         # Log final status
         logging.info("Strategy execution completed")
+
+        # --- BLOCKING WAIT: keep main process alive until trading lifecycle completes ---
+        try:
+            market_close_time = datetime.datetime.strptime("15:30", "%H:%M").time()
+            logging.info("Entering main wait loop to keep process alive until trades/monitoring finish or market close")
+            while True:
+                try:
+                    ist_now = datetime.datetime.now(pytz.timezone('Asia/Kolkata'))
+                except Exception:
+                    ist_now = datetime.datetime.now()
+
+                # If market is closed by time, break
+                if ist_now.time() >= market_close_time:
+                    logging.info("Market close time reached; exiting main loop")
+                    break
+
+                # If strategy signals market_closed, break
+                if getattr(strategy, 'market_closed', False):
+                    logging.info("Strategy flagged market_closed; exiting main loop")
+                    break
+
+                # If there is an active trade, keep running until it finishes
+                active_trade = getattr(strategy, 'active_trade', None)
+                threads = [getattr(strategy, '_paper_status_thread', None), getattr(strategy, '_exit_monitor_thread', None)]
+                threads_alive = any(t and getattr(t, 'is_alive', lambda: False)() for t in threads)
+                if active_trade and isinstance(active_trade, dict) and active_trade.get('symbol'):
+                    logging.debug("Active trade present; main loop sleeping until trade completes")
+                    time.sleep(5)
+                    continue
+
+                # If background threads are alive (monitoring), wait
+                if threads_alive:
+                    logging.debug("Background monitor threads alive; sleeping")
+                    time.sleep(3)
+                    continue
+
+                # No active trades and no monitor threads - safe to exit main loop
+                logging.info("No active trades or monitor threads detected; exiting main loop")
+                break
+        except Exception:
+            logging.exception("Exception in main wait loop; exiting")
+
         return True
         
     except Exception as e:
