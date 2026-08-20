@@ -10,6 +10,7 @@ import time
 import pytz
 import subprocess
 import atexit
+import argparse
 
 # Configure logging
 # Ensure logs directory exists
@@ -95,7 +96,13 @@ def remove_lockfile():
         logging.error(f"Failed to remove lockfile {LOCKFILE}: {e}")
 
 def check_existing_lockfile():
-    """If a lockfile exists and the PID is running, refuse to start. If stale, remove it."""
+    """If a lockfile exists and the PID is running, refuse to start. If stale, remove it.
+
+    This function is conservative: when a PID is present it attempts to query the
+    process command line via PowerShell and only refuses startup if the command
+    line contains `run_strategy.py`. Otherwise the lockfile is treated as stale
+    and removed.
+    """
     try:
         if not os.path.exists(LOCKFILE):
             return True
@@ -107,8 +114,22 @@ def check_existing_lockfile():
             return True
         pid = int(content.splitlines()[0])
         if is_pid_running(pid):
-            logging.error(f"Another run_strategy process appears to be running with PID {pid}. Aborting startup.")
-            return False
+            # Attempt to inspect the running process command line on Windows. If
+            # it contains run_strategy.py we refuse startup; otherwise treat the
+            # lockfile as stale and remove it.
+            try:
+                cmd = ['powershell', '-NoProfile', '-Command', f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"]
+                out = subprocess.check_output(cmd, universal_newlines=True, stderr=subprocess.DEVNULL).strip()
+                if out and 'run_strategy.py' in out:
+                    logging.error(f"Another run_strategy process appears to be running with PID {pid}. Aborting startup.")
+                    return False
+                else:
+                    logging.info(f"PID {pid} is running but command line does not indicate run_strategy (cmd='{out}'). Removing stale lockfile.")
+                    remove_lockfile()
+                    return True
+            except Exception:
+                logging.error(f"PID {pid} appears to be running but process command line could not be inspected. Aborting startup to be safe.")
+                return False
         else:
             logging.info(f"Found stale lockfile (PID {pid} not running). Removing and continuing.")
             remove_lockfile()
@@ -215,8 +236,10 @@ def run_strategy():
             return False
 
         # Now run the main strategy loop (OI analysis, subscriptions, monitoring, trade execution)
+        # If we just waited for market open and 9:20, force analysis to avoid
+        # any tiny timing races that could return a no-op when started early.
         logging.info("Starting main strategy execution (OI analysis, subscriptions, monitoring)")
-        strategy_result = strategy.run_strategy()
+        strategy_result = strategy.run_strategy(force_analysis=True)
         if isinstance(strategy_result, dict):
             if not strategy_result.get('success', False):
                 logging.error(f"Strategy reported failure: {strategy_result}")
@@ -263,6 +286,15 @@ def run_strategy():
                     time.sleep(3)
                     continue
 
+                # If OCO orders were placed but monitoring hasn't started yet,
+                # keep the process alive so the monitoring can begin when the
+                # scheduled time arrives or order lifecycle completes. Strategy
+                # sets `self._oco_placed = True` when it places OCOs.
+                if getattr(strategy, '_oco_placed', False):
+                    logging.debug("OCO orders placed; keeping main loop alive until monitoring/orders complete")
+                    time.sleep(3)
+                    continue
+
                 # No active trades and no monitor threads - safe to exit main loop
                 logging.info("No active trades or monitor threads detected; exiting main loop")
                 break
@@ -278,17 +310,30 @@ def run_strategy():
         return False
 
 if __name__ == "__main__":
-    # Check for existing lockfile / running instance before starting
+    # Parse CLI args (allow disabling lockfile for testing)
+    parser = argparse.ArgumentParser(description='Run the automated options trading strategy')
+    parser.add_argument('--no-lock', action='store_true', help='Do not create or check run_strategy.pid lockfile (use for testing)')
+    args = parser.parse_args()
+
+    # Check for existing lockfile / running instance before starting (unless --no-lock)
     try:
-        if not check_existing_lockfile():
-            logging.error("Aborting run due to existing active run_strategy process.")
-            logging.shutdown()
-            sys.exit(1)
-        # Write our lockfile so other attempts can detect us
-        write_lockfile()
-        logging.info(f"Starting run_strategy with PID {os.getpid()}")
+        if not args.no_lock:
+            if not check_existing_lockfile():
+                logging.error("Aborting run due to existing active run_strategy process.")
+                logging.shutdown()
+                sys.exit(1)
+            # Write our lockfile so other attempts can detect us
+            write_lockfile()
+        else:
+            logging.warning("--no-lock passed: skipping lockfile creation and checks (unsafe for production)")
+
+        logging.info(f"Starting run_strategy with PID {os.getpid()} (no_lock={args.no_lock})")
         run_strategy()
     finally:
-        # Ensure lockfile removed on exit
-        remove_lockfile()
+        # Ensure lockfile removed on exit only if we created it
+        try:
+            if not args.no_lock:
+                remove_lockfile()
+        except Exception:
+            pass
         logging.shutdown()

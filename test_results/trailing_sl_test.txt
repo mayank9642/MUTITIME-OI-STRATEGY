@@ -1,0 +1,22 @@
+=== DIRECT TEST OF TRAILING STOP LOSS ===
+Successfully imported OpenInterestStrategy
+Successfully created strategy instance
+Mock trade: {'symbol': 'NIFTY25JUL18000CE', 'entry_price': 150.0, 'stoploss': 130.0}
+
+Testing with price: 160.0
+Update result: True
+Current stoploss: 147.2
+
+Testing with price: 170.0
+Update result: True
+Current stoploss: 156.4
+
+Testing with price: 150.0
+Update result: False
+Current stoploss: 156.4
+
+Testing with price: 180.0
+Update result: True
+Current stoploss: 165.6
+
+=== TEST COMPLETED SUCCESSFULLY ===

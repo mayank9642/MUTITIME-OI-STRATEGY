@@ -51,7 +51,19 @@ class OpenInterestStrategy:
         self.call_breakout_level = 0
         self.highest_put_oi_strike = 0
         self.highest_call_oi_strike = 0
-        self.fyers = get_fyers_client()
+        # Create fyers client only when not running in simulation/paper mode
+        try:
+            sim_cfg = self.config.get('simulation', {}) if self.config else {}
+            sim_enabled = bool(sim_cfg.get('enabled', True))
+        except Exception:
+            sim_enabled = True
+
+        self.fyers = None
+        if not sim_enabled:
+            try:
+                self.fyers = get_fyers_client()
+            except Exception:
+                logging.debug("Could not initialize fyers client; continuing in paper/simulation mode")
         self.min_premium_threshold = self.config.get('strategy', {}).get('min_premium_threshold', 50.0)
         self.entry_time = None
         self.max_strike_distance = self.config.get('strategy', {}).get('max_strike_distance', 500)
@@ -172,36 +184,29 @@ class OpenInterestStrategy:
                     try:
                         entry_time = self.active_trade.get('entry_time')
                         if entry_time is not None:
-                            # Use IST-aware comparison if entry_time stored with timezone
-                            now_dt = datetime.now(pytz.timezone('Asia/Kolkata'))
-                            try:
-                                elapsed_secs = (now_dt - entry_time).total_seconds()
-                            except Exception:
-                                # Fallback if entry_time is naive or not a datetime
+                            # Ensure lot_size is recorded in active_trade for downstream logging/saving
+                            cfg2 = self.config.get('strategy', {}) if self.config else {}
+                            lot_map = cfg2.get('lot_size_map', {}) if isinstance(cfg2, dict) else {}
+                            lot_size = None
+                            # look for configured lot_map match
+                            for k, v in (lot_map.items() if isinstance(lot_map, dict) else []):
                                 try:
-                                    elapsed_secs = time.time() - float(entry_time.timestamp())
+                                    if k.upper() in self.active_trade['symbol'].upper():
+                                        lot_size = int(v)
+                                        break
                                 except Exception:
-                                    elapsed_secs = 0
-                            max_mins = int(self.config.get('strategy', {}).get('max_trade_duration_minutes', 30))
-                            if elapsed_secs and elapsed_secs >= (max_mins * 60):
-                                logging.info(f"[EXIT MONITOR][TIMEOUT] Active trade exceeded max duration ({max_mins} minutes). Closing trade.")
-                                # Use current LTP as exit price if available
-                                try:
-                                    self._close_active_trade(exit_reason='TIMEOUT', exit_price=current)
-                                except Exception:
-                                    logging.exception("[EXIT MONITOR][ERROR] Failed to close trade on timeout")
-                                return
+                                    continue
+                            if lot_size is None:
+                                # fallback default for NIFTY-like symbols
+                                lot_size = 65 if 'NIFTY' in self.active_trade['symbol'].upper() else 1
+                            self.active_trade['lot_size'] = int(lot_size)
+                            # Also store explicit quantities for clarity when saving
+                            self.active_trade['Quantity(lots)'] = int(self.active_trade.get('lots') or cfg2.get('quantity') or 1)
+                            self.active_trade['Quantity(contracts)'] = int(self.active_trade.get('quantity') or 0)
+                            # keep legacy 'Quantity' key as contracts for compatibility
+                            self.active_trade['Quantity'] = int(self.active_trade.get('quantity') or 0)
                     except Exception:
-                        logging.debug("[EXIT MONITOR] Error while checking max trade duration; continuing monitor")
-                    sl = self.active_trade.get('stoploss')
-                    tgt = self.active_trade.get('target')
-                    # For long BUY trades: exit when price <= SL or >= Target
-                    if sl is not None and current <= sl:
-                        self._close_active_trade(exit_reason='STOPLOSS', exit_price=current)
-                        return
-                    if tgt is not None and current >= tgt:
-                        self._close_active_trade(exit_reason='TARGET', exit_price=current)
-                        return
+                        logging.exception("[EXIT MONITOR] Exception while updating active_trade metadata")
                 except Exception:
                     logging.exception("[EXIT MONITOR] Exception in exit monitor")
                 time.sleep(1)
@@ -594,134 +599,64 @@ class OpenInterestStrategy:
         from datetime import date
         import datetime as _dt
         try:
-            # Define required columns in order
-            # Match Nifty-style header exactly
-            columns = [
+            # Build a normalized list of rows ensuring we capture ALL keys present in trade history.
+            # Start with a canonical column order for operator-friendly Excel output, then append
+            # any extra keys found in the saved trade dicts so nothing is accidentally dropped.
+            canonical = [
                 'Entry DateTime','Index','Symbol','Direction','Entry Price','Exit DateTime','Exit Price',
-                'Stop Loss','Target','Trailing SL','Quantity','Brokerage','P&L','Net P&L','Margin Required',
-                '% Gain/Loss','Max Up (₹)','Max Down (₹)','Max Up (%)','Max Down (%)','VIX','Balance After Trade'
+                'Entry Limit','Stop Loss','Target','Trailing SL','Quantity','Qty','lots','Lot Size','Brokerage','P&L','Net P&L','Margin Required',
+                '% Gain/Loss','Max Up (₹)','Max Down (₹)','Max Up (%)','Max Down (%)','VIX','Balance After Trade','Order ID','Group ID','Bracket Order ID',
+                'Filled Time','Exit Reason'
             ]
 
-            # Build a normalized list of rows ensuring all required fields exist and derived fields are computed
+            # Collect all unique keys present across trade_history
+            all_keys = set()
+            for t in list(self.trade_history):
+                if isinstance(t, dict):
+                    all_keys.update([k for k in t.keys() if isinstance(k, str)])
+
+            # Build final columns order: canonical first (if present), then the rest sorted
+            extra_keys = [k for k in sorted(all_keys) if k not in canonical]
+            columns = canonical + extra_keys
+
             rows = []
             for t in list(self.trade_history):
-                try:
-                    entry_dt = t.get('Entry DateTime')
-                    exit_dt = t.get('Exit DateTime')
-                    symbol = t.get('Symbol')
-                    idx = t.get('Index', '')
-                    direction = t.get('Direction', '')
-                    entry_price = float(t.get('Entry Price') or 0)
-                    exit_price = float(t.get('Exit Price') or 0)
-                    stop_loss = t.get('SL') if 'SL' in t else t.get('Stop Loss', t.get('stoploss', ''))
-                    trailing_sl = t.get('trailing_stoploss', t.get('Trailing SL', ''))
-                    target = t.get('Target', t.get('target', ''))
-                    qty = t.get('Quantity', t.get('Quantity', t.get('quantity', 0)))
-                    try:
-                        qty = int(qty)
-                    except Exception:
-                        try:
-                            qty = int(float(qty))
-                        except Exception:
-                            pass
-                    pnl = float(t.get('P&L', t.get('P&L', 0) or 0))
-                except Exception:
-                    # Skip malformed entries but continue saving others
-                    logging.debug("Skipping malformed trade history entry during save")
+                if not isinstance(t, dict):
+                    logging.debug("Skipping malformed trade history entry during save (not a dict)")
                     continue
+                # Start with a shallow copy to avoid modifying original
+                row = {k: t.get(k, '') for k in columns}
 
-                # Compute brokerage (approx) using available helper
-                brokerage = 0.0
+                # Normalize a few known numeric fields for consistency
                 try:
-                    brokerage, _ = self.calculate_fyers_option_charges(entry_price, exit_price, qty)
+                    if row.get('Entry Price', '') != '':
+                        row['Entry Price'] = float(row.get('Entry Price') or 0)
                 except Exception:
-                    brokerage = 0.0
-
-                net_pnl = pnl - float(brokerage)
-                # Margin required: be careful not to double-count lot-size.
-                # execute_trade() stores 'quantity' as actual contracts (lots * lot_size)
-                # and also stores 'lots' as the configured number of lots. Use 'lots'
-                # when available to compute margin as entry_price * lots * lot_size.
+                    pass
                 try:
-                    strategy_cfg = self.config.get('strategy', {}) if self.config else {}
-                    quantity_is_lots = bool(strategy_cfg.get('quantity_is_lots', True))
-                    lot_map = strategy_cfg.get('lot_size_map', {'NIFTY': 65})
-                    # Determine lot_size for this symbol (default NIFTY=65)
-                    lot_size = 1
-                    sym_upper = (symbol or '').upper()
-                    import re
-                    for k, v in lot_map.items():
+                    if row.get('Exit Price', '') != '':
+                        row['Exit Price'] = float(row.get('Exit Price') or 0)
+                except Exception:
+                    pass
+
+                # Compute brokerage if not present
+                try:
+                    if row.get('Brokerage', '') == '' or row.get('Brokerage') is None:
                         try:
-                            pattern = r"\b" + re.escape(str(k).upper()) + r"\b"
-                            if re.search(pattern, sym_upper):
-                                lot_size = int(v)
-                                break
+                            qty = int(t.get('Quantity') or t.get('Qty') or 0)
                         except Exception:
-                            continue
-                    if lot_size == 1 and 'NIFTY' in sym_upper:
-                        lot_size = 65
-
-                    # If 'lots' is present in the saved trade record, compute margin from lots*lot_size.
-                    lots_val = t.get('lots') if isinstance(t, dict) else None
-                    try:
-                        lots_val = int(lots_val) if lots_val is not None else None
-                    except Exception:
-                        lots_val = None
-
-                    if lots_val is not None and quantity_is_lots:
-                        margin_required = float(entry_price) * float(lots_val) * float(lot_size)
-                    else:
-                        # Otherwise assume 'quantity' already contains total contracts (lots * lot_size)
-                        margin_required = float(entry_price) * float(qty)
+                            qty = 0
+                        try:
+                            brokerage, _ = self.calculate_fyers_option_charges(row.get('Entry Price') or 0, row.get('Exit Price') or 0, qty)
+                            row['Brokerage'] = brokerage
+                        except Exception:
+                            row['Brokerage'] = ''
                 except Exception:
-                    margin_required = 0.0
-                pct_gain_loss = (pnl / margin_required * 100.0) if margin_required else 0.0
+                    pass
 
-                max_up = float(t.get('Max Up', t.get('max up', t.get('max_up', 0)) or 0))
-                max_down = float(t.get('Max Down', t.get('max down', t.get('max_down', 0)) or 0))
-                max_up_pct = float(t.get('Max Up %', t.get('max up %', t.get('max_up_pct', 0)) or 0))
-                max_down_pct = float(t.get('Max Down %', t.get('max down %', t.get('max_down_pct', 0)) or 0))
-
-                vix = ''
-                try:
-                    vix = self.live_prices.get('NSE:VIX') or self.live_prices.get('VIX') or ''
-                except Exception:
-                    vix = ''
-
-                balance_after = t.get('Balance After Trade', '')
-
-                row = {
-                    'Entry DateTime': entry_dt,
-                    'Index': idx,
-                    'Symbol': symbol,
-                    'Direction': direction,
-                    'Entry Price': entry_price,
-                    'Exit DateTime': exit_dt,
-                    'Exit Price': exit_price,
-                    'Stop Loss': stop_loss,
-                    'Target': target,
-                    'Trailing SL': trailing_sl,
-                    'Quantity': qty,
-                    'Brokerage': brokerage,
-                    'P&L': pnl,
-                    'Net P&L': net_pnl,
-                    'Margin Required': margin_required,
-                    '% Gain/Loss': pct_gain_loss,
-                    'Max Up (₹)': max_up,
-                    'Max Down (₹)': max_down,
-                    'Max Up (%)': max_up_pct,
-                    'Max Down (%)': max_down_pct,
-                    'VIX': vix,
-                    'Balance After Trade': balance_after
-                }
                 rows.append(row)
 
-            df = pd.DataFrame(rows)
-            # Ensure all columns present
-            for col in columns:
-                if col not in df.columns:
-                    df[col] = ''
-            df = df[columns]
+            df = pd.DataFrame(rows, columns=columns)
             # Save to CSV
             df.to_csv('logs/trade_history.csv', index=False)
             # Save to Excel with today's date
@@ -912,6 +847,12 @@ class OpenInterestStrategy:
         """
         try:
             logging.info("STRATEGY START: Running Open Interest Option Buying Strategy")
+            # Track what actions we actually performed so callers can distinguish
+            # between a no-op (e.g., waiting for time or config-disabled) and a
+            # real execution that placed orders / started monitoring.
+            oi_performed = False
+            oco_placed = False
+            monitoring_started = False
             # Get current time in IST
             ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
             current_time = ist_now.time()
@@ -935,9 +876,12 @@ class OpenInterestStrategy:
                 return self.wait_for_market_open()
             # Wait for 9:20 before running OI analysis and breakout monitoring
             analysis_time = datetime.strptime("09:20", "%H:%M").time()
-            # Add a small tolerance to avoid race conditions around the exact second boundary
+            # Compute seconds until analysis (9:20). If any positive seconds remain
+            # and force_analysis is not set, return a waiting status. Using >0 avoids
+            # an off-by-one race where remaining_secs==1 would skip analysis and
+            # let the function proceed to return success without doing work.
             remaining_secs = (datetime.combine(ist_now.date(), analysis_time) - datetime.combine(ist_now.date(), current_time)).total_seconds()
-            if remaining_secs > 1 and not force_analysis:
+            if remaining_secs > 0 and not force_analysis:
                 mins, secs = divmod(remaining_secs, 60)
                 logging.info(f"[STRATEGY][INFO] Waiting for 9:20... Current time: {current_time.strftime('%H:%M:%S')}, OI analysis in: {int(mins)}m {int(secs)}s")
                 return {"success": False, "message": "Waiting for 9:20"}
@@ -947,8 +891,9 @@ class OpenInterestStrategy:
                     oi_result = self.identify_high_oi_strikes()
                     if not oi_result:
                         logging.error("[STRATEGY][ERROR] OI analysis failed. Exiting strategy run.")
-                        return {"success": False, "message": "OI analysis failed"}
+                        return {"success": False, "message": "OI analysis failed", "oi_performed": False}
                     self.breakout_levels_fixed = True
+                    oi_performed = True
                 # --- Original Trade Entry Logic ---
                 if (self.highest_call_oi_symbol and self.call_breakout_level) or (self.highest_put_oi_symbol and self.put_breakout_level):
                     # Subscribe to valid symbols for monitoring only after OI analysis and after market open
@@ -973,20 +918,73 @@ class OpenInterestStrategy:
                         if ce_sym and pe_sym:
                             logging.info(f"[OCO][PLACE] Placing OCO BRACKET orders for CE:{ce_sym} @ {self.call_breakout_level} and PE:{pe_sym} @ {self.put_breakout_level}")
                             # Place simulated bracket OCO orders (entry limit = breakout level)
-                            self.place_oco_bracket_orders(ce_symbol=ce_sym, ce_entry=self.call_breakout_level,
+                            placed = self.place_oco_bracket_orders(ce_symbol=ce_sym, ce_entry=self.call_breakout_level,
                                                           pe_symbol=pe_sym, pe_entry=self.put_breakout_level,
                                                           qty=qty)
+                            if placed:
+                                        oco_placed = True
+                                        # mark on the strategy instance so external runner can observe
+                                        try:
+                                            self._oco_placed = True
+                                        except Exception:
+                                            pass
                         else:
                             logging.info("[OCO][SKIP] Not enough symbols to place OCO orders (need both CE and PE).")
                     except Exception:
                         logging.exception("[OCO][ERROR] Failed to place OCO GTT orders")
+                    # Attempt to subscribe/start monitoring. If this run happened
+                    # slightly before 09:20 (e.g. 09:19:59) we may have placed OCOs
+                    # but monitoring/subscription will be blocked by strict time
+                    # checks. In that case wait the remaining seconds until
+                    # analysis_time and then start subscriptions and monitoring
+                    # (do NOT re-run OI analysis or re-place orders).
                     self.subscribe_to_valid_symbols(symbols)
                     breakout_detected = self.monitor_for_breakout()
+                    if breakout_detected:
+                        monitoring_started = True
+                    else:
+                        # If monitoring didn't start because it was too early,
+                        # compute remaining seconds and wait a short while then retry
+                        try:
+                            tz = pytz.timezone('Asia/Kolkata')
+                            ist_now2 = datetime.now(tz)
+                        except Exception:
+                            # Fallback to naive local time if tz-aware now fails
+                            ist_now2 = datetime.now()
+                        # datetime.combine returns a naive datetime. If ist_now2 is
+                        # timezone-aware we must localize analysis_dt to the same
+                        # timezone to avoid subtracting naive and aware datetimes.
+                        naive_analysis_dt = datetime.combine(ist_now2.date(), analysis_time)
+                        if getattr(ist_now2, 'tzinfo', None) is not None:
+                            try:
+                                analysis_dt = tz.localize(naive_analysis_dt)
+                            except Exception:
+                                # If localization fails for any reason, fall back to
+                                # attaching the same tzinfo directly.
+                                analysis_dt = naive_analysis_dt.replace(tzinfo=ist_now2.tzinfo)
+                        else:
+                            analysis_dt = naive_analysis_dt
+                        remaining = (analysis_dt - ist_now2).total_seconds()
+                        if remaining > 0 and oco_placed:
+                            # Sleep the remaining time plus a tiny buffer then retry once
+                            sleep_for = min(max(remaining + 0.2, 0.1), 10)
+                            logging.info(f"[STRATEGY][INFO] OCOs placed before 09:20; waiting {sleep_for:.2f}s then starting subscriptions/monitoring")
+                            time.sleep(sleep_for)
+                            # Retry subscription and monitor once
+                            self.subscribe_to_valid_symbols(symbols)
+                            breakout_detected2 = self.monitor_for_breakout()
+                            if breakout_detected2:
+                                monitoring_started = True
                     # Only log trade entry in monitor_for_breakout/execute_trade
                 else:
                     logging.warning("[STRATEGY][WARN] Trade entry skipped: missing symbol or breakout level.")
             # Position management is handled by continuous_position_monitor thread
-            return {"success": True, "message": "Strategy executed successfully"}
+            # Return a more informative status: if we did nothing, indicate that
+            # so callers (and logs) can surface it clearly.
+            if not (oi_performed or oco_placed or monitoring_started):
+                logging.info("[STRATEGY][NOOP] Strategy run completed without OI analysis/orders/monitoring.")
+                return {"success": False, "message": "No OI analysis or orders placed", "oi_performed": oi_performed, "oco_placed": oco_placed, "monitoring_started": monitoring_started}
+            return {"success": True, "message": "Strategy executed successfully", "oi_performed": oi_performed, "oco_placed": oco_placed, "monitoring_started": monitoring_started}
         except Exception as e:
             logging.error(f"[STRATEGY][ERROR] Exception: {str(e)}")
             logging.error(traceback.format_exc())
@@ -1111,6 +1109,67 @@ class OpenInterestStrategy:
             logging.error(f"[BREAKOUT][ERROR] Error monitoring for breakout: {str(e)}")
             return None
 
+    def _get_vix_value(self):
+        """Return the current VIX value from live prices or a configured fallback."""
+        try:
+            v = self.live_prices.get('NSE:VIX') or self.live_prices.get('VIX')
+            if v is not None:
+                return float(v)
+        except Exception:
+            pass
+        try:
+            return float(self.config.get('strategy', {}).get('vix_fallback', 12.0))
+        except Exception:
+            return 12.0
+
+    def _compute_sl_tg(self, entry_price: float):
+        """Compute stoploss and target based on VIX+premium mapping in config.
+
+        Returns (stoploss, target, mode_string)
+        """
+        cfg = self.config.get('strategy', {}) if self.config else {}
+        mapping = cfg.get('vix_mapping', {}) if isinstance(cfg, dict) else {}
+        enabled = bool(mapping.get('enabled', False))
+        # Prefer live VIX; fall back to configured vix_fallback
+        try:
+            vix = float(self._get_vix_value() or mapping.get('vix_fallback') or cfg.get('vix_fallback') or 11.0)
+        except Exception:
+            vix = 11.0
+        premium = float(entry_price)
+
+        # Ported mapping logic from BANKNIFTY-BREAKOUT-STRATEGY: dynamic SL/TG based on VIX and premium
+        # Behavior:
+        # - vix < 10: target_pct = 7% if premium <= 500 else 4%
+        # - 10 <= vix < 12: target_pct = 10% if premium <= 500 else 5%
+        # - vix >= 12: target_pct = 12% if premium <= 500 else 7%
+        # SL pct = target_pct (symmetric)
+        try:
+            if vix < 10:
+                target_pct = 0.07 if premium <= 500 else 0.04
+            elif vix < 12:
+                target_pct = 0.10 if premium <= 500 else 0.05
+            else:
+                target_pct = 0.12 if premium <= 500 else 0.07
+            # target_pct above is fractional (like 0.07 meaning 7%), convert to percent for consistency
+            target_pct_pct = float(target_pct) * 100 if target_pct < 1 else float(target_pct)
+            sl_pct_pct = target_pct_pct
+            stoploss = round(entry_price * (1 - sl_pct_pct / 100.0), 2)
+            target = round(entry_price * (1 + target_pct_pct / 100.0), 2)
+            return stoploss, target, f"banknifty_vix_based_v{vix:.2f}"
+        except Exception:
+            # final fallback to configured percentages
+            try:
+                sl_pct = float(cfg.get('stoploss_pct', 20))
+            except Exception:
+                sl_pct = 20.0
+            try:
+                tg_pct = float(cfg.get('target_pct', 40))
+            except Exception:
+                tg_pct = 40.0
+            stoploss = round(entry_price * (1 - sl_pct / 100.0), 2)
+            target = round(entry_price * (1 + tg_pct / 100.0), 2)
+            return stoploss, target, 'fallback_pct'
+
     def log_trade_update(self):
         """Log trade update and monitoring info after entry, including P&L, max up/down, trailing SL"""
         if not self.active_trade:
@@ -1126,8 +1185,59 @@ class OpenInterestStrategy:
         if current_price is None:
             logging.error(f"[TRADE][UPDATE][ERROR] No tick DataFrame LTP available for active trade contract. Skipping trade update.")
             return
-        pnl = (current_price - entry_price) * quantity
-        pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price else 0
+        # Quantity stored in active_trade is the actual number of contracts
+        # (i.e., lots * lot_size when configured). For human clarity we log
+        # both the per-lot P&L and the total P&L.
+        try:
+            cfg = self.config.get('strategy', {}) if self.config else {}
+            lot_map = cfg.get('lot_size_map', {}) if isinstance(cfg, dict) else {}
+            configured_lots = int(self.active_trade.get('lots') or cfg.get('quantity') or 0)
+        except Exception:
+            configured_lots = None
+
+        # Infer lot_size: prefer explicit stored value, then lot_map lookup, then NIFTY default 65
+        lot_size = None
+        try:
+            if 'lot_size' in self.active_trade and self.active_trade.get('lot_size'):
+                lot_size = int(self.active_trade.get('lot_size'))
+        except Exception:
+            lot_size = None
+        if lot_size is None:
+            try:
+                # try to find matching key from lot_map
+                for k, v in lot_map.items():
+                    if k.upper() in (symbol or '').upper():
+                        lot_size = int(v)
+                        break
+            except Exception:
+                lot_size = None
+        if lot_size is None:
+            # Fallback default for NIFTY-style contracts
+            try:
+                if 'NIFTY' in (symbol or '').upper():
+                    lot_size = 65
+                else:
+                    lot_size = 1
+            except Exception:
+                lot_size = 1
+
+        # Compute price movement
+        price_diff = float(current_price) - float(entry_price)
+        # Total contracts stored in quantity (contracts = lots * lot_size)
+        try:
+            total_contracts = int(quantity or 0)
+        except Exception:
+            total_contracts = 0
+
+        # Total P&L in currency = price_diff * total_contracts
+        pnl = price_diff * total_contracts
+        # Per-lot P&L (currency per lot) = price_diff * lot_size
+        try:
+            pnl_per_lot = price_diff * int(lot_size)
+        except Exception:
+            pnl_per_lot = price_diff
+
+        pnl_pct = ((price_diff) / entry_price * 100) if entry_price else 0
         max_up = self.active_trade.get('max_up', None)
         max_up_pct = self.active_trade.get('max_up_pct', None)
         max_down = self.active_trade.get('max_down', None)
@@ -1166,9 +1276,12 @@ class OpenInterestStrategy:
                 max_up_str = f"{max_up_val_f:.2f} ({max_up_pct_f:.2f}%)"
                 max_down_str = f"{max_down_val_f:.2f} ({max_down_pct_f:.2f}%)"
                 try:
-                    # Emit full PAPER STATUS including MaxUp/MaxDn with percentages
+                    # Emit full PAPER STATUS including per-lot and total P&L so operators
+                    # can immediately tell whether the configured quantity was interpreted
+                    # as lots or contracts.
+                    lots_info = f"lots={configured_lots}" if configured_lots is not None else "lots=?"
                     logging.info(
-                        f"[PAPER STATUS] {symbol} | LTP: {float(current_price):.2f} | Entry: {float(entry_price):.2f} | SL: {float(self.active_trade.get('stoploss', 0)):.2f} | Target: {float(target):.2f} | PnL: {pnl:.2f} | MaxUp: {max_up_val_f:.2f} ({max_up_pct_f:.2f}%) | MaxDn: {max_down_val_f:.2f} ({max_down_pct_f:.2f}%)"
+                        f"[PAPER STATUS] {symbol} | LTP: {float(current_price):.2f} | Entry: {float(entry_price):.2f} | SL: {float(self.active_trade.get('stoploss', 0)):.2f} | Target: {float(target):.2f} | PnL(Total): {pnl:.2f} | PnL/lot: {pnl_per_lot:.2f} | Quantity(contracts): {total_contracts} | {lots_info} | MaxUp: {max_up_val_f:.2f} ({max_up_pct_f:.2f}%) | MaxDn: {max_down_val_f:.2f} ({max_down_pct_f:.2f}%)"
                     )
                     # Update last paper status time to enforce rate-limiting
                     try:
@@ -2352,15 +2465,24 @@ class OpenInterestStrategy:
             canonical = self.get_canonical_symbol(symbol)
             if quantity is None:
                 try:
-                    quantity = int(self.config.get('strategy', {}).get('quantity', 25))
+                    # Default to 1 lot when no configuration present to avoid large accidental positions
+                    quantity = int(self.config.get('strategy', {}).get('quantity', 1))
                 except Exception:
-                    quantity = 25
+                    quantity = 1
             # Interpret configured 'quantity' as number of lots when a lot_size_map is provided
             try:
                 cfg = self.config.get('strategy', {}) if self.config else {}
                 lot_map = cfg.get('lot_size_map', {}) if isinstance(cfg, dict) else {}
                 quantity_is_lots = bool(cfg.get('quantity_is_lots', True))
                 actual_quantity = int(quantity)
+                # Allow a config override to force trading exactly 1 lot regardless of configured quantity
+                try:
+                    if bool(cfg.get('force_trade_one_lot', False)):
+                        quantity = 1
+                        actual_quantity = 1
+                        logging.info("[EXECUTE] force_trade_one_lot enabled in config: forcing quantity to 1 lot")
+                except Exception:
+                    pass
                 if quantity_is_lots and lot_map:
                     # find a matching key in lot_map that appears in the symbol name
                     for k, v in lot_map.items():
@@ -2389,16 +2511,23 @@ class OpenInterestStrategy:
                 logging.error(f"[EXECUTE][ERROR] Invalid entry price for {canonical}: {entry_price}")
                 return False
             # Build active trade structure
+            # Record configured lots value (what operator set in config) for clarity
+            try:
+                configured_lots = int(self.config.get('strategy', {}).get('quantity', 1))
+            except Exception:
+                configured_lots = None
+
             self.active_trade = {
                 'symbol': canonical,
                 'entry_price': float(entry_price),
-                'entry_time': datetime.now(pytz.timezone('Asia/Kolkata')), 
+                'entry_time': datetime.now(pytz.timezone('Asia/Kolkata')),
                 # quantity stored as actual contracts (lots * lot_size when configured)
                 'quantity': int(quantity),
-                'lots': int(self.config.get('strategy', {}).get('quantity', 25)) if isinstance(self.config.get('strategy', {}).get('quantity', None), int) else None,
+                'lots': configured_lots,
                 'side': side,
-                'stoploss': round(entry_price * 0.7, 2),  # placeholder: initial stoploss at 30% of entry
-                'target': round(entry_price * 1.5, 2),    # placeholder: target at +50%
+                # placeholders; will be overwritten below using VIX mapping or configured percentages
+                'stoploss': None,
+                'target': None,
             }
             logging.info(f"[TRADE][ENTER] Entered PAPER trade: {self.active_trade['symbol']} | Entry: {self.active_trade['entry_price']} | Qty: {self.active_trade['quantity']}")
             # After entering a trade, prefer trade-monitoring logs over symbol-mapping and
@@ -2422,10 +2551,48 @@ class OpenInterestStrategy:
             # Place a simulated bracket order (entry + SL + Target) in OrderManager for paper mode
             try:
                 cfg = self.config.get('strategy', {}) if self.config else {}
-                sl_pct = float(cfg.get('stoploss_pct', 20))
-                tgt_pct = float(cfg.get('target_pct', 40))
-                stoploss = round(self.active_trade['entry_price'] * (1 - sl_pct / 100.0), 2)
-                target = round(self.active_trade['entry_price'] * (1 + tgt_pct / 100.0), 2)
+                # Compute SL/Target using VIX+premium mapping when enabled, otherwise fall back to configured percentages
+                try:
+                    stoploss, target, mode = self._compute_sl_tg(entry_price=float(self.active_trade['entry_price']))
+                except Exception:
+                    # Fallback to simple percentage-based SL/TG
+                    try:
+                        sl_pct = float(cfg.get('stoploss_pct', 20))
+                    except Exception:
+                        sl_pct = 20.0
+                    try:
+                        tgt_pct = float(cfg.get('target_pct', 40))
+                    except Exception:
+                        tgt_pct = 40.0
+                    stoploss = round(self.active_trade['entry_price'] * (1 - sl_pct / 100.0), 2)
+                    target = round(self.active_trade['entry_price'] * (1 + tgt_pct / 100.0), 2)
+                    mode = 'fallback_pct'
+                # Record mode and ensure human-friendly metadata saved with the trade
+                try:
+                    self.active_trade['SL_TG_Mode'] = mode
+                except Exception:
+                    pass
+                try:
+                    # ensure 'Lot Size' key is present for trade history exports
+                    if 'lot_size' in self.active_trade:
+                        self.active_trade['Lot Size'] = int(self.active_trade['lot_size'])
+                    else:
+                        # compute a guess for lot size if missing
+                        cfg2 = self.config.get('strategy', {}) if self.config else {}
+                        lot_map = cfg2.get('lot_size_map', {}) if isinstance(cfg2, dict) else {}
+                        lot_size = None
+                        for k, v in (lot_map.items() if isinstance(lot_map, dict) else []):
+                            try:
+                                if k.upper() in self.active_trade['symbol'].upper():
+                                    lot_size = int(v)
+                                    break
+                            except Exception:
+                                continue
+                        if lot_size is None:
+                            lot_size = 65 if 'NIFTY' in self.active_trade['symbol'].upper() else 1
+                        self.active_trade['Lot Size'] = int(lot_size)
+                except Exception:
+                    logging.debug("[EXECUTE] Could not populate Lot Size metadata")
                 bracket = self.order_manager.place_bracket_order(symbol=canonical, side=1, qty=self.active_trade['quantity'], entry_price=self.active_trade['entry_price'], stoploss=stoploss, target=target, tag='BRACKET')
                 # Debug/log the raw response from OrderManager to diagnose missing bracket placements
                 # Log raw bracket response at INFO so it's visible in normal runs/simulations

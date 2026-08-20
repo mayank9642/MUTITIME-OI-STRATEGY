@@ -1,21 +1,57 @@
+data:
+  cache_enabled: true
+  historical_days: 5
+  max_retries: 3
+  retry_delay: 1
+  timeframe: '5'
 fyers:
-  access_token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiZDoxIiwiZDoyIiwieDowIiwieDoxIiwieDoyIl0sImF0X2hhc2giOiJnQUFBQUFCcHpKUkNpdDV4bE1UR1cxd21tOWdyMVkyaW5vbndfeU1jdmlHemowQ1hGRUFPYjBlWm1CMjQzVWdJR0MzMElUVXJ6T1gtVXpNV2RzVjBGczdEYWw4d0Q4QTVOYkt3M0ljUWxGWnZPUVd6Nnk3YlVHVT0iLCJkaXNwbGF5X25hbWUiOiIiLCJvbXMiOiJLMSIsImhzbV9rZXkiOiI5MTg2OTgzMTBiZDI4M2QwNGZlNjI5Y2M5YjExMDc2YzlmM2U5M2U4OTdjZjc5ZTQxMDk5MDM2OSIsImlzRGRwaUVuYWJsZWQiOiJOIiwiaXNNdGZFbmFibGVkIjoiTiIsImZ5X2lkIjoiWU0wNDA3NyIsImFwcFR5cGUiOjIwMCwiZXhwIjoxNzc1MDg5ODAwLCJpYXQiOjE3NzUwMTQ5NzgsImlzcyI6ImFwaS5meWVycy5pbiIsIm5iZiI6MTc3NTAxNDk3OCwic3ViIjoiYWNjZXNzX3Rva2VuIn0.BqcKaBYwlxA9d7GqyG95Qv3Z1uPBec25ua5EcDQMSJs
-  client_id: HVMLS7T82E-200
+  access_token: <REDACTED - replace with your FYERS access token locally>
+  client_id: <REDACTED - FYERS client id>
   redirect_uri: https://trade.fyers.in/api-login/redirect-uri/index.html
-  secret_key: DTjLilYHSz1X4K64
-  token_expiry: '2026-04-02 09:12:58'
+  secret_key: <REDACTED - FYERS secret key>
+  static_ip: 154.210.207.8
+  token_expiry: '2026-04-21 09:07:14'
   totp_key: ''
 logging:
-  file: logs/strategy.log
+  console_output: true
   level: INFO
+  log_file: logs/strategy.log
+  log_trades: true
+market_holidays:
+- '2024-01-26'
+- '2024-03-08'
+- '2024-03-29'
+- '2024-05-01'
+- '2024-08-15'
+- '2024-10-02'
+- '2024-11-01'
+- '2024-11-15'
+monitoring:
+  max_daily_loss: -5000
+  max_daily_trades: 10
+  track_daily_pnl: true
+simulation:
+  enabled: true
+  initial_balance: 100000
 strategy:
   analysis_time: 09:20
+  banknifty_options_enabled: true
+  banknifty_qty: 1
+  banknifty_symbol: NSE:NIFTYBANK-INDEX
+  breakout_buffer: 5
+  breakout_buffer_points: 0.1
   breakout_pct: 10
-  lot_size_map:
-    NIFTY: 65
+  compensate_with_nifty: true
+  enable_websocket: true
+  force_trade_one_lot: true
+  max_entry_points_above_breakout: 3
+  max_entry_premium_pct: 1
   max_holding_minutes: 30
   max_strike_distance: 500
   min_premium_threshold: 50.0
+  nifty_compensation_qty: 2
+  nifty_qty: 1
+  nifty_symbol: NSE:NIFTY50-INDEX
   partial_exits:
   - exit_percentage: 30
     min_profit_pct: 8
@@ -26,16 +62,76 @@ strategy:
   quantity: 1
   quantity_is_lots: true
   risk_reward_ratio: 2
+  rounding:
+    decimals: 2
+    enabled: true
+    method: nearest_tick
+    tick_size: 0.05
+  sl_points: 15
   stoploss_pct: 20
   symbol: NSE:NIFTY50-INDEX
-  trailing:
-    cooldown_secs: 30
-    max_modifications: 20
-    min_move_pct: 0.5
-    prefer_amend: true
-  trailing_modify:
-    retry_count: 2
-    retry_delay_secs: 0.5
+  target_points: 30
   trailing_stop_pct: 8
   trailing_trigger_pct: 12
   use_trailing_stop: true
+  vix_log_csv: logs/vix_levels.csv
+  vix_logging_enabled: true
+  vix_mapping:
+    buckets: []
+    enabled: true
+    premium_cutoff: 500.0
+    vix_fallback: 12.0
+  vix_symbol: NSE:INDIAVIX-INDEX
+  wait_for_market_open: true
+timing:
+  first_candle_end_time: 09:20
+  market_open_time: 09:15
+  trading_end_time: '15:30'
+  wait_for_market_open: false
+trading:
+  entry_filters:
+    momentum_confirmation: true
+    momentum_periods: 3
+    volume_confirmation: true
+    volume_periods: 5
+    volume_threshold: 1.2
+  partial_exits:
+    enabled: true
+    exits: []
+  risk_management:
+    atr_multiplier: 2
+    atr_periods: 14
+    breakout_buffer: 2
+    max_entry_premium_pct: 15
+    max_holding_period_minutes: 90
+    min_premium_threshold: 20
+    stop_loss_points: 20
+    stoploss_pct: 20
+    target_pct: 40
+    target_points: 40
+    use_atr_stop_loss: false
+  symbols:
+    banknifty:
+      enabled: true
+      first_candle:
+        close: 59784.9
+        high: 59784.9
+        low: 59598.95
+        open: 59598.95
+      fixed_expiry: '2025-12-30'
+      index_symbol: NSE:NIFTYBANK-INDEX
+      quantity: 15
+      step_size: 100
+    nifty:
+      enabled: true
+      index_symbol: NSE:NIFTY50-INDEX
+      quantity: 25
+      step_size: 50
+  trailing_stop:
+    enabled: true
+    trail_pct: 5
+    trigger_pct: 10
+websocket:
+  ping_interval: 30
+  reconnect_attempts: 5
+  reconnect_delay: 2
